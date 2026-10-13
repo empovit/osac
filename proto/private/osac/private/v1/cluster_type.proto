@@ -330,6 +330,40 @@ message ClusterStatus {
   // Per-operator installation state, synced from the ClusterOrder's
   // AddOnOperatorJobs via the feedback controller.
   repeated AddOnOperatorStatus add_on_operators = 12;
+
+  // OpenShift version observed on the hosted control plane.
+  string observed_cp_version = 13 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  reserved 14;
+  reserved "upgrade";
+
+  // Component upgrade attempts in acceptance order. The last entry is the current or most recent attempt.
+  repeated ClusterUpgradeHistoryEntry upgrade_history = 15 [(google.api.field_behavior) = OUTPUT_ONLY];
+}
+
+// State of a component upgrade attempt.
+enum ClusterUpgradeState {
+  CLUSTER_UPGRADE_STATE_UNSPECIFIED = 0;
+  CLUSTER_UPGRADE_STATE_PENDING = 1;
+  CLUSTER_UPGRADE_STATE_PROGRESSING = 2;
+  CLUSTER_UPGRADE_STATE_TIMED_OUT = 3;
+  CLUSTER_UPGRADE_STATE_SUCCEEDED = 4;
+  CLUSTER_UPGRADE_STATE_FAILED = 5;
+}
+
+// State and progress of one component upgrade attempt.
+message ClusterUpgradeHistoryEntry {
+  // Either `control_plane` or `node_pool:<node-set-name>`.
+  string component = 1;
+  string source_version = 2;
+  string target_version = 3;
+  google.protobuf.Timestamp accepted_time = 4;
+  google.protobuf.Timestamp last_state_time = 5;
+  ClusterUpgradeState state = 6;
+  string message = 7;
+
+  // Identifier correlating this history entry with private operator feedback.
+  string attempt_id = 8 [(cleanapi.field).private = true];
 }
 
 // Represents the overall state of a cluster.
@@ -435,6 +469,12 @@ message ClusterNodeSet {
   //
   // Immutable after creation.
   BareMetalInstanceTypeReference baremetal_instance_type = 4 [(google.api.field_behavior) = IMMUTABLE];
+
+  // Desired OpenShift version of this node set.
+  ClusterVersionReference version = 5;
+
+  // OpenShift version observed on this node set. Populated only in Cluster status.
+  string observed_version = 6 [(google.api.field_behavior) = OUTPUT_ONLY];
 }
 
 // Local reference to a Cluster resource.
