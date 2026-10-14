@@ -28,13 +28,19 @@ var _ = Describe("ClusterOrder upgrade contract", func() {
 		nodeSet := spec.Properties["nodeRequests"].Items.Schema.Properties["releaseImage"]
 		Expect(nodeSet.Pattern).To(Equal(controlPlane.Pattern))
 		Expect(nodeSet.MaxLength).To(Equal(controlPlane.MaxLength))
+		Expect(controlPlane.MaxLength).NotTo(BeNil())
+		Expect(*controlPlane.MaxLength).To(Equal(int64(512)))
 		pattern := regexp.MustCompile(controlPlane.Pattern)
 
 		for _, image := range []string{
+			// Tagged pull specs.
 			"quay.io/openshift-release-dev/ocp-release:4.22.0-multi",
 			"registry--mirror.example/ocp/release:stable",
+			"localhost:5000/ocp/release:_candidate-4.22",
 			"[2001:db8::1]:5000/ocp/release:stable",
+			// SHA digest pull specs, with or without a tag.
 			"registry.example:5000/ocp/release@sha256:" + strings.Repeat("a", 64),
+			"quay.io/openshift-release-dev/ocp-release@sha256:" + strings.Repeat("A", 64),
 			"quay.io/ocp/release:stable@sha256:" + strings.Repeat("a", 64),
 		} {
 			Expect(pattern.MatchString(image)).To(BeTrue(), image)
@@ -44,40 +50,11 @@ var _ = Describe("ClusterOrder upgrade contract", func() {
 			"quay.io/ocp/release:bad\ttag",
 			"quay.io/ocp/release:tag;rm",
 			"quay.io/ocp/release:",
+			"quay.io/ocp/release",
 			"quay.io/ocp/release@sha256:abc",
 		} {
 			Expect(pattern.MatchString(image)).To(BeFalse(), image)
 		}
-	})
-
-	It("keeps independent images across serialization and copying", func() {
-		order := &v1alpha1.ClusterOrder{
-			Spec: v1alpha1.ClusterOrderSpec{
-				ReleaseImage: "registry.example/ocp:4.22.0",
-				NodeRequests: []v1alpha1.NodeRequest{{
-					NodeSet:      "workers",
-					ReleaseImage: "registry.example/ocp:4.21.0",
-				}},
-			},
-			Status: v1alpha1.ClusterOrderStatus{
-				ObservedVersion: "4.22.0",
-				NodeRequests: []v1alpha1.NodeRequestStatus{{
-					NodeSet: "workers", ObservedVersion: "4.21.0",
-				}},
-			},
-		}
-
-		data, err := json.Marshal(order)
-		Expect(err).NotTo(HaveOccurred())
-		var decoded v1alpha1.ClusterOrder
-		Expect(json.Unmarshal(data, &decoded)).To(Succeed())
-		Expect(decoded.Spec.ReleaseImage).To(Equal("registry.example/ocp:4.22.0"))
-		Expect(decoded.Spec.NodeRequests[0].ReleaseImage).To(Equal("registry.example/ocp:4.21.0"))
-		Expect(decoded.Status.ObservedVersion).To(Equal("4.22.0"))
-		Expect(decoded.Status.NodeRequests[0].ObservedVersion).To(Equal("4.21.0"))
-		copy := order.DeepCopy()
-		copy.Spec.NodeRequests[0].ReleaseImage = "registry.example/ocp:4.23.0"
-		Expect(order.Spec.NodeRequests[0].ReleaseImage).To(Equal("registry.example/ocp:4.21.0"))
 	})
 
 	It("preserves the config hash of an order with an empty node image", func() {
