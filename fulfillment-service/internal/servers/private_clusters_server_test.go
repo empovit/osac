@@ -3436,7 +3436,7 @@ var _ = Describe("Private clusters server", func() {
 			}.Build()
 			updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 				Object: privatev1.Cluster_builder{
-					Id: object.GetId(),
+					Id:   object.GetId(),
 					Spec: privatev1.ClusterSpec_builder{NodeSets: nodeSets}.Build(),
 				}.Build(),
 				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
