@@ -55,14 +55,6 @@ var _ = DescribeMigration("Protect ClusterVersions referenced by node sets", fun
 		expectInUse(deleteVersion(ctx, "node-version"))
 	})
 
-	It("protects a legacy name-only node-set reference", func(ctx context.Context) {
-		insertVersion(ctx, "node-version", "4-17-0")
-		insertCluster(ctx, "cluster", `{"spec":{"node_sets":{"workers":{"version":{"name":"4-17-0"}}}}}`)
-		Expect(tool.Migrate(ctx, 127)).To(Succeed())
-
-		expectInUse(deleteVersion(ctx, "node-version"))
-	})
-
 	It("uses a canonical ID ahead of a matching name", func(ctx context.Context) {
 		_, err := conn.Exec(ctx, `insert into projects (id, name, tenant, project, data)
 			values ('other-project', 'other-project', 'system', '', '{}')`)
@@ -135,4 +127,5 @@ var _ = DescribeMigration("Protect ClusterVersions referenced by node sets", fun
 			expectInUse(deleteVersion(ctx, id))
 		}
 	})
+
 })

@@ -10,23 +10,15 @@
 create or replace function check_cluster_version_not_in_use() returns trigger as $$
 begin
   if exists (
-    select 1 from clusters c
+    select 1
+    from clusters c
     where c.deletion_timestamp = 'epoch'
       and (
-        c.data->'spec'->'version'->>'id' = old.id
-        or (coalesce(c.data->'spec'->'version'->>'id', '') = ''
-          and c.data->'spec'->'version'->>'name' = old.name)
+        c.data #>> '{spec,version,id}' = old.id
         or exists (
           select 1
-          from jsonb_each(
-            case when jsonb_typeof(c.data->'spec'->'node_sets') = 'object'
-              then c.data->'spec'->'node_sets'
-              else '{}'::jsonb
-            end
-          ) as ns(name, node_set)
-          where ns.node_set->'version'->>'id' = old.id
-            or (coalesce(ns.node_set->'version'->>'id', '') = ''
-              and ns.node_set->'version'->>'name' = old.name)
+          from jsonb_each(c.data #> '{spec,node_sets}') as ns(name, node_set)
+          where ns.node_set #>> '{version,id}' = old.id
         )
       )
   ) then
@@ -36,11 +28,10 @@ begin
   end if;
 
   if exists (
-    select 1 from cluster_templates
-    where deletion_timestamp = 'epoch'
-      and (data->'spec_defaults'->'version'->>'id' = old.id
-        or (coalesce(data->'spec_defaults'->'version'->>'id', '') = ''
-          and data->'spec_defaults'->'version'->>'name' = old.name))
+    select 1
+    from cluster_templates t
+    where t.deletion_timestamp = 'epoch'
+      and t.data #>> '{spec_defaults,version,id}' = old.id
   ) then
     raise exception using
       errcode = 'Z0003',
@@ -51,12 +42,8 @@ begin
     select 1 from cluster_catalog_items c
     where c.deletion_timestamp = 'epoch'
       and (
-        (c.data->'fields'->'version'->'locked'->>'id' = old.id
-        or (coalesce(c.data->'fields'->'version'->'locked'->>'id', '') = ''
-          and c.data->'fields'->'version'->'locked'->>'name' = old.name))
-        or (c.data->'fields'->'version'->'editable'->'default_value'->>'id' = old.id
-        or (coalesce(c.data->'fields'->'version'->'editable'->'default_value'->>'id', '') = ''
-          and c.data->'fields'->'version'->'editable'->'default_value'->>'name' = old.name))
+        c.data #>> '{fields,version,locked,id}' = old.id
+        or c.data #>> '{fields,version,editable,default_value,id}' = old.id
       )
   ) then
     raise exception using
