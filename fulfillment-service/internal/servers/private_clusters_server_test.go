@@ -3586,6 +3586,93 @@ var _ = Describe("Private clusters server", func() {
 				updated.GetObject().GetSpec().GetVersion())).To(BeTrue())
 		})
 
+		Describe("exclusive component version updates", func() {
+			var cluster *privatev1.Cluster
+
+			BeforeEach(func() {
+				for _, target := range []struct{ id, name, version string }{
+					{"cv-next", "4-18-0", "4.18.0"},
+					{"cv-later", "4-19-0", "4.19.0"},
+				} {
+					seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+						Id: target.id,
+						Metadata: privatev1.Metadata_builder{
+							Name: target.name, Tenant: testTenant,
+						}.Build(),
+						Spec: privatev1.ClusterVersionSpec_builder{
+							Image:   "quay.io/openshift-release-dev/ocp-release:" + target.version + "-multi",
+							Enabled: proto.Bool(true), Version: target.version,
+						}.Build(),
+					}.Build())
+				}
+				created, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "exclusive-versions"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				cluster = created.GetObject()
+			})
+
+			updateVersions := func(controlPlane string, nodeVersions map[string]string) (*privatev1.Cluster, error) {
+				nodeSets := make(map[string]*privatev1.ClusterNodeSet, len(cluster.GetSpec().GetNodeSets()))
+				for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+					nodeSets[name] = proto.Clone(nodeSet).(*privatev1.ClusterNodeSet)
+				}
+				for name, version := range nodeVersions {
+					nodeSets[name].SetVersion(privatev1.ClusterVersionReference_builder{Name: version}.Build())
+				}
+				spec := privatev1.ClusterSpec_builder{NodeSets: nodeSets}.Build()
+				paths := []string{"spec.node_sets"}
+				if controlPlane != "" {
+					spec.SetVersion(privatev1.ClusterVersionReference_builder{Name: controlPlane}.Build())
+					paths = append(paths, "spec.version")
+				}
+				updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object:     privatev1.Cluster_builder{Id: cluster.GetId(), Spec: spec}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: paths},
+				}.Build())
+				if err != nil {
+					return nil, err
+				}
+				return updated.GetObject(), nil
+			}
+
+			It("rejects changing the control plane and a node set together", func() {
+				_, err := updateVersions("4-18-0", map[string]string{"compute": "4-19-0"})
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("only one component version")))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec(), cluster.GetSpec())).To(BeTrue())
+			})
+
+			It("rejects changing two node sets together", func() {
+				_, err := updateVersions("", map[string]string{"compute": "4-18-0", "gpu": "4-19-0"})
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("only one component version")))
+			})
+
+			It("accepts one node-set version change", func() {
+				updated, err := updateVersions("", map[string]string{"compute": "4-18-0"})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+				Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal("cv-default"))
+			})
+
+			It("accepts a control-plane change with unchanged node-set versions", func() {
+				updated, err := updateVersions("4-18-0", nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetSpec().GetVersion().GetId()).To(Equal("cv-next"))
+				for _, nodeSet := range updated.GetSpec().GetNodeSets() {
+					Expect(nodeSet.GetVersion().GetId()).To(Equal("cv-default"))
+				}
+			})
+		})
+
 		It("pins new node sets to the resolved cluster version", func() {
 			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
@@ -3605,7 +3692,7 @@ var _ = Describe("Private clusters server", func() {
 			}
 		})
 
-		It("pins legacy node sets to the previous control plane version on its first change", func() {
+		It("rejects mixed upgrades and pins legacy node sets on a control plane-only change", func() {
 			clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
 				SetLogger(logger).
 				SetTenancyLogic(tenancy).
@@ -3638,6 +3725,27 @@ var _ = Describe("Private clusters server", func() {
 					Image: "quay.io/openshift-release-dev/ocp-release:4.18.0-multi", Enabled: proto.Bool(true), Version: "4.18.0",
 				}.Build(),
 			}.Build())
+
+			// Both stored NodeSets predate independent versions. An explicit target on
+			// compute still counts as a second change alongside the control plane.
+			mixedNodeSets := make(map[string]*privatev1.ClusterNodeSet)
+			for name, nodeSet := range created.GetObject().GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion()).To(BeNil())
+				mixedNodeSets[name] = proto.Clone(nodeSet).(*privatev1.ClusterNodeSet)
+			}
+			mixedNodeSets["compute"].SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: clusterID,
+					Spec: privatev1.ClusterSpec_builder{
+						Version:  privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+						NodeSets: mixedNodeSets,
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version", "spec.node_sets"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("only one component version")))
 
 			updateVersion := func(version string) *privatev1.Cluster {
 				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{

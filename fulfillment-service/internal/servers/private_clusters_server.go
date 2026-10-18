@@ -444,6 +444,9 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 		if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate, mask, sizeOnlyNodeSets); err != nil {
 			return err
 		}
+		if err := validateExclusiveVersionUpdate(current, candidate); err != nil {
+			return err
+		}
 		if updateIncludesField(mask, "spec.version") &&
 			!sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
 			populateUnsetNodeSetVersions(candidate.GetSpec().GetNodeSets(), current.GetSpec().GetVersion())
@@ -505,16 +508,46 @@ func populateUnsetNodeSetVersions(nodeSets map[string]*privatev1.ClusterNodeSet,
 	}
 }
 
-// sameClusterVersionReference reports whether two version references identify the same
-// version. Ids decide when both references carry one: an update whose stored reference is
-// id-only gets its stored name filled in by enrichment (validateVersionUpdate resolves the
-// reference), and that fill must not count as a version change or metering would split
-// billing on nothing. When either reference carries no id, the names decide.
-func sameClusterVersionReference(current, candidate *privatev1.ClusterVersionReference) bool {
-	if current.GetId() != "" && candidate.GetId() != "" {
-		return current.GetId() == candidate.GetId()
+// validateExclusiveVersionUpdate allows one existing component's version to
+// change per edit. A legacy node set without a stored version already follows
+// the stored control-plane version; pinning that baseline is not an upgrade.
+func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error {
+	changes := 0
+	if !sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
+		changes++
 	}
-	return current.GetName() == candidate.GetName()
+	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
+		stored, exists := current.GetSpec().GetNodeSets()[name]
+		if !exists || nodeSet == nil {
+			continue
+		}
+		baseline := stored.GetVersion()
+		if refKey(baseline) == "" {
+			baseline = current.GetSpec().GetVersion()
+		}
+		target := nodeSet.GetVersion()
+		if refKey(target) == "" {
+			continue
+		}
+		if !sameClusterVersionReference(baseline, target) {
+			changes++
+			if changes > 1 {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument,
+					"only one component version can be changed per edit: control plane or one node set")
+			}
+		}
+	}
+	return nil
+}
+
+func sameClusterVersionReference(a, b *privatev1.ClusterVersionReference) bool {
+	if a.GetId() != "" && b.GetId() != "" {
+		return a.GetId() == b.GetId()
+	}
+	if a.GetName() != "" && b.GetName() != "" {
+		return a.GetName() == b.GetName()
+	}
+	return refKey(a) == refKey(b)
 }
 
 // prepareUpdatedClusterNodeSets retains resolved metadata for unchanged NodeSets and
