@@ -55,6 +55,16 @@ var _ = DescribeMigration("Protect ClusterVersions referenced by node sets", fun
 		expectInUse(deleteVersion(ctx, "node-version"))
 	})
 
+	It("ignores non-object node-set values when checking deletion", func(ctx context.Context) {
+		insertVersion(ctx, "unreferenced-version", "4-17-0")
+		insertCluster(ctx, "null-node-sets", `{"spec":{"node_sets":null}}`)
+		insertCluster(ctx, "array-node-sets", `{"spec":{"node_sets":[]}}`)
+		insertCluster(ctx, "string-node-sets", `{"spec":{"node_sets":"invalid"}}`)
+		Expect(tool.Migrate(ctx, 127)).To(Succeed())
+
+		Expect(deleteVersion(ctx, "unreferenced-version")).To(Succeed())
+	})
+
 	It("uses a canonical ID ahead of a matching name", func(ctx context.Context) {
 		_, err := conn.Exec(ctx, `insert into projects (id, name, tenant, project, data)
 			values ('other-project', 'other-project', 'system', '', '{}')`)

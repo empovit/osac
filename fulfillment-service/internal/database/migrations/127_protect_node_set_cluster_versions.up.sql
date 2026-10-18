@@ -17,7 +17,12 @@ begin
         c.data #>> '{spec,version,id}' = old.id
         or exists (
           select 1
-          from jsonb_each(c.data #> '{spec,node_sets}') as ns(name, node_set)
+          from jsonb_each(
+            case when jsonb_typeof(c.data #> '{spec,node_sets}') = 'object'
+              then c.data #> '{spec,node_sets}'
+              else '{}'::jsonb
+            end
+          ) as ns(name, node_set)
           where ns.node_set #>> '{version,id}' = old.id
         )
       )
