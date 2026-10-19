@@ -1345,7 +1345,7 @@ var _ = Describe("Clusters server", func() {
 			Expect(err.Error()).To(ContainSubstring("status.version_transition_time is output-only"))
 		})
 
-		It("Update object with mask", func() {
+		It("updates node-set size then version in separate masked requests", func() {
 			// Create the object:
 			createResponse, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 				Object: publicv1.Cluster_builder{
@@ -1401,6 +1401,32 @@ var _ = Describe("Clusters server", func() {
 			Expect(err).ToNot(HaveOccurred())
 			object = getResponse.GetObject()
 			verify(object)
+
+			seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+				Id:       "public-node-target",
+				Metadata: privatev1.Metadata_builder{Name: "4-18-public", Tenant: testTenant}.Build(),
+				Spec: privatev1.ClusterVersionSpec_builder{
+					Image:   "quay.io/openshift-release-dev/ocp-release:4.18.7-multi",
+					Enabled: proto.Bool(true), Version: "4.18.7",
+				}.Build(),
+			}.Build())
+			updated, err := server.Update(ctx, publicv1.ClustersUpdateRequest_builder{
+				Object: publicv1.Cluster_builder{
+					Id: object.GetId(),
+					Spec: publicv1.ClusterSpec_builder{NodeSets: map[string]*publicv1.ClusterNodeSet{
+						"compute": publicv1.ClusterNodeSet_builder{
+							Version: publicv1.ClusterVersionReference_builder{Name: "4-18-public"}.Build(),
+						}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.version"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetSize()).To(Equal(int32(4)))
+			Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("public-node-target"))
+			Expect(updated.GetObject().GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal(
+				object.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()))
+			Expect(updated.GetObject().GetSpec().GetVersion().GetId()).To(Equal(object.GetSpec().GetVersion().GetId()))
 		})
 
 		It("Allows removing a node set when multiple exist", func() {

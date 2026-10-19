@@ -237,6 +237,7 @@ func resolveClusterNodeSetReferencesForTest(ctx context.Context, request proto.M
 		return err
 	}
 	references.RegisterDAOLookup(validator, "osac.private.v1.ClusterVersionReference", clusterVersionsDao)
+	references.RegisterDAOLookup(validator, "osac.public.v1.ClusterVersionReference", clusterVersionsDao)
 	_, err = validator.UnaryServer(ctx, request,
 		&grpc.UnaryServerInfo{FullMethod: method},
 		func(context.Context, any) (any, error) { return nil, nil })
@@ -1272,7 +1273,7 @@ var _ = Describe("Private clusters server", func() {
 				case "update":
 					current := privatev1.Cluster_builder{Spec: privatev1.ClusterSpec_builder{}.Build()}.Build()
 					err = server.prepareUpdatedClusterNodeSets(ctx, current, cluster,
-						&fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}}, false)
+						cluster.GetSpec().GetNodeSets(), &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}}, false)
 				case "fabric":
 					err = server.resolveFabricInterfaces(ctx, cluster)
 				}
@@ -1337,7 +1338,7 @@ var _ = Describe("Private clusters server", func() {
 			} else {
 				current := privatev1.Cluster_builder{Spec: privatev1.ClusterSpec_builder{}.Build()}.Build()
 				err = server.prepareUpdatedClusterNodeSets(ctx, current, cluster,
-					&fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}}, false)
+					cluster.GetSpec().GetNodeSets(), &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}}, false)
 			}
 			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 			Expect(err).To(MatchError(ContainSubstring("node_sets.workers.baremetal_instance_type")))
@@ -3663,6 +3664,50 @@ var _ = Describe("Private clusters server", func() {
 				Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal("cv-default"))
 			})
 
+			It("rejects changing a node-set size and version in the same masked request", func() {
+				original := cluster.GetSpec().GetNodeSets()["compute"]
+				newSize := original.GetSize() + 1
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"compute": privatev1.ClusterNodeSet_builder{
+								Size:    proto.Int32(newSize),
+								Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+						"spec.node_sets.compute.size", "spec.node_sets.compute.version",
+					}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("node-set size and component version")))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec(), cluster.GetSpec())).To(BeTrue())
+			})
+
+			It("rejects changing a node-set size and version in a full-object update", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				compute := full.GetSpec().GetNodeSets()["compute"]
+				compute.SetSize(compute.GetSize() + 1)
+				compute.SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("node-set size and component version")))
+			})
+
+			It("rejects changing a node-set size with the control-plane version", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				compute := full.GetSpec().GetNodeSets()["compute"]
+				compute.SetSize(compute.GetSize() + 1)
+				full.GetSpec().SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("node-set size and component version")))
+			})
+
 			It("accepts a control-plane change with unchanged node-set versions", func() {
 				updated, err := updateVersions("4-18-0", nil)
 				Expect(err).ToNot(HaveOccurred())
@@ -3670,6 +3715,30 @@ var _ = Describe("Private clusters server", func() {
 				for _, nodeSet := range updated.GetSpec().GetNodeSets() {
 					Expect(nodeSet.GetVersion().GetId()).To(Equal("cv-default"))
 				}
+			})
+
+			It("accepts one node-set version change in a full-object update", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				full.GetSpec().GetNodeSets()["compute"].SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+				updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+				Expect(updated.GetObject().GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal("cv-default"))
+			})
+
+			It("rejects a version selection for an unknown node set", func() {
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"missing": privatev1.ClusterNodeSet_builder{
+								Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.missing.version"}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 			})
 		})
 
@@ -3692,7 +3761,7 @@ var _ = Describe("Private clusters server", func() {
 			}
 		})
 
-		It("rejects mixed upgrades and pins legacy node sets on a control plane-only change", func() {
+		It("rejects mixed upgrades and pins legacy node sets on the first control-plane upgrade", func() {
 			clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
 				SetLogger(logger).
 				SetTenancyLogic(tenancy).
@@ -3747,6 +3816,29 @@ var _ = Describe("Private clusters server", func() {
 			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 			Expect(err).To(MatchError(ContainSubstring("only one component version")))
 
+			metadataOnly, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id:       clusterID,
+					Metadata: privatev1.Metadata_builder{Description: "edited"}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.description"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(metadataOnly.GetObject().GetSpec(), created.GetObject().GetSpec())).To(BeTrue())
+			sizeOnly, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: clusterID,
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(4)}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.size"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			for _, nodeSet := range sizeOnly.GetObject().GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion()).To(BeNil())
+			}
+
 			updateVersion := func(version string) *privatev1.Cluster {
 				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 					Object: privatev1.Cluster_builder{
@@ -3766,18 +3858,34 @@ var _ = Describe("Private clusters server", func() {
 			for _, nodeSet := range unchanged.GetSpec().GetNodeSets() {
 				Expect(nodeSet.GetVersion()).To(BeNil())
 			}
+			updateNodeSetVersion := func(version string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: clusterID,
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"compute": privatev1.ClusterNodeSet_builder{
+								Version: privatev1.ClusterVersionReference_builder{Name: version}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			unchangedNodeSet := updateNodeSetVersion("4-17-0")
+			Expect(unchangedNodeSet.GetSpec().GetNodeSets()["compute"].GetVersion()).To(BeNil())
+			workerUpdated := updateNodeSetVersion("4-18-0")
+			Expect(workerUpdated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+			Expect(workerUpdated.GetSpec().GetNodeSets()["gpu"].GetVersion()).To(BeNil())
 
 			updated := updateVersion("4-18-0")
 			Expect(updated.GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
-			for _, nodeSet := range updated.GetSpec().GetNodeSets() {
-				Expect(nodeSet.GetVersion().GetId()).To(Equal(oldVersion.GetId()))
-				Expect(nodeSet.GetVersion().GetName()).To(Equal(oldVersion.GetName()))
-			}
+			Expect(updated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+			Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal(oldVersion.GetId()))
 			updated = updateVersion("4-17-0")
-			for _, nodeSet := range updated.GetSpec().GetNodeSets() {
-				Expect(nodeSet.GetVersion().GetId()).To(Equal(oldVersion.GetId()))
-				Expect(nodeSet.GetVersion().GetName()).To(Equal(oldVersion.GetName()))
-			}
+			Expect(updated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+			Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal(oldVersion.GetId()))
 		})
 
 		It("Preserves existing version when update sends empty name", func() {

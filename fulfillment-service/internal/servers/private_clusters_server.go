@@ -410,7 +410,7 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 	if err != nil {
 		return
 	}
-	// Legacy upgrade validation may normalize version; never mutate the caller's request.
+	// Version validation canonicalizes selected references; keep the caller's request intact.
 	request = proto.Clone(request).(*privatev1.ClustersUpdateRequest)
 	err = s.validateVersionUpdate(ctx, request)
 	if err != nil {
@@ -441,7 +441,8 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 		}
 		mask := request.GetUpdateMask()
 		sizeOnlyNodeSets := len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)
-		if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate, mask, sizeOnlyNodeSets); err != nil {
+		if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate,
+			request.GetObject().GetSpec().GetNodeSets(), mask, sizeOnlyNodeSets); err != nil {
 			return err
 		}
 		if err := validateExclusiveVersionUpdate(current, candidate); err != nil {
@@ -449,12 +450,11 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 		}
 		if updateIncludesField(mask, "spec.version") &&
 			!sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
+			// Preserve legacy node-set versions before changing the control plane.
 			populateUnsetNodeSetVersions(candidate.GetSpec().GetNodeSets(), current.GetSpec().GetVersion())
-			// Metering splits version-dimensioned usage at the acceptance time, so stamp it in
-			// the same transaction that applies the new version. Same-version updates never
-			// re-stamp: validateVersionUpdate already normalized them to the stored reference,
-			// and enrichment that only fills the stored name into an id-only stored reference
-			// is not a version change either (see sameClusterVersionReference).
+			// Metering splits control-plane version usage at acceptance time, so stamp it in
+			// the same transaction that applies the new control-plane version. An unchanged
+			// selection keeps its stored reference and does not re-stamp.
 			if !candidate.HasStatus() {
 				candidate.SetStatus(privatev1.ClusterStatus_builder{}.Build())
 			}
@@ -509,10 +509,12 @@ func populateUnsetNodeSetVersions(nodeSets map[string]*privatev1.ClusterNodeSet,
 }
 
 // validateExclusiveVersionUpdate allows one existing component's version to
-// change per edit. A legacy node set without a stored version already follows
-// the stored control-plane version; pinning that baseline is not an upgrade.
+// change per edit, without changing a node-set size in the same edit. A legacy
+// node set without a stored version already follows the stored control-plane
+// version; pinning that baseline is not an upgrade.
 func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error {
 	changes := 0
+	sizeChanged := false
 	if !sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
 		changes++
 	}
@@ -520,6 +522,9 @@ func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error
 		stored, exists := current.GetSpec().GetNodeSets()[name]
 		if !exists || nodeSet == nil {
 			continue
+		}
+		if stored.GetSize() != nodeSet.GetSize() || stored.HasSize() != nodeSet.HasSize() {
+			sizeChanged = true
 		}
 		baseline := stored.GetVersion()
 		if refKey(baseline) == "" {
@@ -537,6 +542,10 @@ func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error
 			}
 		}
 	}
+	if changes > 0 && sizeChanged {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"node-set size and component version cannot be changed in the same update")
+	}
 	return nil
 }
 
@@ -550,16 +559,40 @@ func sameClusterVersionReference(a, b *privatev1.ClusterVersionReference) bool {
 	return refKey(a) == refKey(b)
 }
 
-// prepareUpdatedClusterNodeSets retains resolved metadata for unchanged NodeSets and
-// checks that newly selected hardware types are not being deleted.
+// prepareUpdatedClusterNodeSets preserves stored fields for nested node-set
+// updates and checks that newly selected hardware types are not being deleted.
 func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
-	ctx context.Context, current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool,
+	ctx context.Context, current, candidate *privatev1.Cluster,
+	requestedNodeSets map[string]*privatev1.ClusterNodeSet, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool,
 ) error {
 	if !s.updateAffectsNodeSets(mask) {
 		return nil
 	}
+	partialSizeOrVersionUpdate := isUpdatingOnlyNodeSizeOrVersionFields(mask) && !sizeOnlyNodeSets
 	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
 		existing := current.GetSpec().GetNodeSets()[name]
+		if partialSizeOrVersionUpdate {
+			if existing == nil {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
+			}
+			// Each masked map path replaces its entry, so read all selected fields
+			// from the request before rebuilding the complete stored node set.
+			selected := requestedNodeSets[name]
+			selectedVersion := selected.GetVersion()
+			selectedSize, hasSelectedSize := selected.GetSize(), selected.HasSize()
+			nodeSet = cloneMessage(existing)
+			if updateIncludesField(mask, "spec.node_sets."+name+".version") {
+				nodeSet.SetVersion(selectedVersion)
+			}
+			if updateIncludesField(mask, "spec.node_sets."+name+".size") {
+				if hasSelectedSize {
+					nodeSet.SetSize(selectedSize)
+				} else {
+					nodeSet.ClearSize()
+				}
+			}
+			candidate.GetSpec().GetNodeSets()[name] = nodeSet
+		}
 		if nodeSet != nil && refKey(nodeSet.GetVersion()) == "" {
 			version := current.GetSpec().GetVersion()
 			if existing != nil {
@@ -576,8 +609,8 @@ func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
 		if existing != nil &&
 			(refKey(existing.GetBaremetalInstanceType()) == refKey(nodeSet.GetBaremetalInstanceType()) ||
 				(s.isUpdatingOnlySizes(mask) && refKey(nodeSet.GetBaremetalInstanceType()) == "")) {
-			// Nested map masks replace the entire NodeSet message, so size-only updates
-			// must restore both server-owned fields from the persisted NodeSet.
+			// Keep the stored hardware reference when unchanged. Size-only masks
+			// also need the stored fabric interface.
 			nodeSet.SetBaremetalInstanceType(cloneMessage(existing.GetBaremetalInstanceType()))
 			if sizeOnlyNodeSets {
 				nodeSet.SetFabricInterface(existing.GetFabricInterface())
@@ -598,6 +631,19 @@ func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
 		}
 	}
 	return nil
+}
+
+func isUpdatingOnlyNodeSizeOrVersionFields(mask *fieldmaskpb.FieldMask) bool {
+	if len(mask.GetPaths()) == 0 {
+		return false
+	}
+	for _, path := range mask.GetPaths() {
+		if !strings.HasPrefix(path, "spec.node_sets.") ||
+			(!strings.HasSuffix(path, ".size") && !strings.HasSuffix(path, ".version")) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *PrivateClustersServer) validateSpecUpdateRequest(request *privatev1.ClustersUpdateRequest) error {
@@ -777,8 +823,10 @@ func (s *PrivateClustersServer) validateNodeSetsUpdate(ctx context.Context,
 		return nil
 	}
 
-	// Check if only size fields are being updated - these are always allowed
-	if s.isUpdatingOnlySizes(request.GetUpdateMask()) {
+	// Full-object updates and nested size/version masks are checked against the
+	// prepared candidate instead of treating a partial node-set map as a replacement.
+	if s.isUpdatingOnlySizes(request.GetUpdateMask()) ||
+		isUpdatingOnlyNodeSizeOrVersionFields(request.GetUpdateMask()) {
 		return nil
 	}
 
@@ -1038,16 +1086,15 @@ func (s *PrivateClustersServer) validateAddOnOperatorImmutability(
 	return nil
 }
 
-// validateVersionUpdate ensures version stays valid on update. Absent
-// version is normalized to the existing value (cannot be cleared once set).
-// Changed values are validated the same way as Create via ensureClusterVersion.
-// An update that resolves to the same version the cluster already carries (same id)
-// keeps the stored reference: persisting the enriched {id, name} shape over an id-only
-// stored reference would differ by the name, and the metering source contract counts
-// that as a version change, splitting billing on nothing.
+// validateVersionUpdate uses the existing control-plane catalog checks for
+// changed control-plane and node-set selections. Unset legacy node-set versions
+// use the stored control-plane version for comparison.
 func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) error {
-	if !updateIncludesField(request.GetUpdateMask(), "spec.version") {
+	mask := request.GetUpdateMask()
+	controlPlaneUpdated := updateIncludesField(mask, "spec.version")
+	nodeSetsUpdated := s.updateAffectsNodeSets(mask)
+	if !controlPlaneUpdated && !nodeSetsUpdated {
 		return nil
 	}
 	newSpec := request.GetObject().GetSpec()
@@ -1058,29 +1105,71 @@ func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 	if err != nil || !found {
 		return err
 	}
-	newRef := newSpec.GetVersion()
-	existingRef := existing.GetSpec().GetVersion()
-	if newRef == nil || (newRef.GetName() == "" && newRef.GetId() == "") {
-		if existingRef != nil {
-			newSpec.SetVersion(existingRef)
+	if controlPlaneUpdated {
+		version, err := s.validateVersionReferenceUpdate(ctx, existing.GetMetadata(),
+			existing.GetSpec().GetVersion(), newSpec.GetVersion())
+		if err != nil {
+			return err
 		}
+		newSpec.SetVersion(version)
+	}
+	if !nodeSetsUpdated || (len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)) {
 		return nil
 	}
-	if existingRef != nil && newRef.GetName() == existingRef.GetName() {
-		newSpec.SetVersion(cloneMessage(existingRef))
-		return nil
-	}
-	version, err := resolveAndCanonicalizeReference(ctx, s.clusterVersionsDao, existing.GetMetadata(), newRef, "version", grpccodes.InvalidArgument)
-	if err != nil {
-		return err
-	}
-	if err := validateResolvedClusterVersion(version, version.GetMetadata().GetName(), ""); err != nil {
-		return err
-	}
-	if sameClusterVersionReference(existingRef, newRef) {
-		newSpec.SetVersion(cloneMessage(existingRef))
+	return s.validateNodeSetVersionUpdates(ctx, existing, newSpec)
+}
+
+func (s *PrivateClustersServer) validateNodeSetVersionUpdates(ctx context.Context,
+	existing *privatev1.Cluster, newSpec *privatev1.ClusterSpec) error {
+	for name, nodeSet := range newSpec.GetNodeSets() {
+		if nodeSet == nil || refKey(nodeSet.GetVersion()) == "" {
+			continue
+		}
+		storedNodeSet := existing.GetSpec().GetNodeSets()[name]
+		if storedNodeSet == nil {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
+		}
+		stored := storedNodeSet.GetVersion()
+		legacy := refKey(stored) == ""
+		if legacy {
+			stored = existing.GetSpec().GetVersion()
+		}
+		version, err := s.validateVersionReferenceUpdate(ctx, existing.GetMetadata(), stored, nodeSet.GetVersion())
+		if err != nil {
+			return grpcstatus.Errorf(grpcstatus.Code(err), "node set '%s': %s", name, grpcstatus.Convert(err).Message())
+		}
+		if legacy && sameClusterVersionReference(stored, version) {
+			nodeSet.SetVersion(nil)
+		} else {
+			nodeSet.SetVersion(version)
+		}
 	}
 	return nil
+}
+
+// validateVersionReferenceUpdate preserves an omitted or unchanged selection;
+// changed selections use the same catalog lookup for control planes and node sets.
+func (s *PrivateClustersServer) validateVersionReferenceUpdate(ctx context.Context,
+	owner *privatev1.Metadata, stored, selected *privatev1.ClusterVersionReference,
+) (*privatev1.ClusterVersionReference, error) {
+	if refKey(selected) == "" || sameClusterVersionReference(stored, selected) {
+		if stored == nil {
+			return nil, nil
+		}
+		return cloneMessage(stored), nil
+	}
+	version, err := resolveAndCanonicalizeReference(ctx, s.clusterVersionsDao, owner,
+		selected, "version", grpccodes.InvalidArgument)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResolvedClusterVersion(version, version.GetMetadata().GetName(), ""); err != nil {
+		return nil, err
+	}
+	if sameClusterVersionReference(stored, selected) {
+		return cloneMessage(stored), nil
+	}
+	return selected, nil
 }
 
 // validateClusterNetworkAttachmentImmutability rejects changes to the complete
