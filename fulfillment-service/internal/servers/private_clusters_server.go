@@ -346,7 +346,13 @@ func (s *PrivateClustersServer) prepareCreate(ctx context.Context, candidate *pr
 	if err != nil {
 		return
 	}
-	populateUnsetNodeSetVersions(spec.GetNodeSets(), spec.GetVersion())
+	for name, nodeSet := range spec.GetNodeSets() {
+		version, err := s.validateNewNodeSetVersion(ctx, candidate.GetMetadata(), spec.GetVersion(), nodeSet.GetVersion(), name)
+		if err != nil {
+			return err
+		}
+		nodeSet.SetVersion(version)
+	}
 	if key := spec.GetSshPublicKey(); key != "" {
 		if err = validateOpenSSHPublicKey(key); err != nil {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.ssh_public_key: %s", err)
@@ -445,13 +451,11 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 			request.GetObject().GetSpec().GetNodeSets(), mask, sizeOnlyNodeSets); err != nil {
 			return err
 		}
-		if err := validateExclusiveVersionUpdate(current, candidate); err != nil {
+		controlPlaneChanged := pinUnsetNodeSetVersionsForUpdate(current, candidate, mask)
+		if err := validateExclusiveVersionUpdate(current, candidate, mask); err != nil {
 			return err
 		}
-		if updateIncludesField(mask, "spec.version") &&
-			!sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
-			// Preserve legacy node-set versions before changing the control plane.
-			populateUnsetNodeSetVersions(candidate.GetSpec().GetNodeSets(), current.GetSpec().GetVersion())
+		if controlPlaneChanged {
 			// Metering splits control-plane version usage at acceptance time, so stamp it in
 			// the same transaction that applies the new control-plane version. An unchanged
 			// selection keeps its stored reference and does not re-stamp.
@@ -508,13 +512,28 @@ func populateUnsetNodeSetVersions(nodeSets map[string]*privatev1.ClusterNodeSet,
 	}
 }
 
+// pinUnsetNodeSetVersionsForUpdate preserves the established control-plane
+// version for node sets that have no stored version of their own.
+func pinUnsetNodeSetVersionsForUpdate(current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask) bool {
+	versionOnlyNodeSet := len(mask.GetPaths()) == 1 &&
+		strings.HasPrefix(mask.GetPaths()[0], "spec.node_sets.") &&
+		strings.HasSuffix(mask.GetPaths()[0], ".version")
+	controlPlaneChanged := updateIncludesField(mask, "spec.version") &&
+		!sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion())
+	if (updateIncludesField(mask, "spec.node_sets") && !versionOnlyNodeSet) || controlPlaneChanged {
+		populateUnsetNodeSetVersions(candidate.GetSpec().GetNodeSets(), current.GetSpec().GetVersion())
+	}
+	return controlPlaneChanged
+}
+
 // validateExclusiveVersionUpdate allows one existing component's version to
-// change per edit, without changing a node-set size in the same edit. A legacy
-// node set without a stored version already follows the stored control-plane
-// version; pinning that baseline is not an upgrade.
-func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error {
+// change per edit. A node-set version change cannot share an edit with a size
+// change. A legacy node set without a stored version already follows the stored
+// control-plane version; pinning that baseline is not an upgrade.
+func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask) error {
 	changes := 0
 	sizeChanged := false
+	changedNodeSet := ""
 	if !sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
 		changes++
 	}
@@ -536,15 +555,21 @@ func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error
 		}
 		if !sameClusterVersionReference(baseline, target) {
 			changes++
+			changedNodeSet = name
 			if changes > 1 {
 				return grpcstatus.Errorf(grpccodes.InvalidArgument,
 					"only one component version can be changed per edit: control plane or one node set")
 			}
 		}
 	}
-	if changes > 0 && sizeChanged {
+	if changedNodeSet != "" && sizeChanged {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"node-set size and component version cannot be changed in the same update")
+			"node-set size and node-set version cannot be changed in the same update")
+	}
+	if changedNodeSet != "" && (len(mask.GetPaths()) != 1 ||
+		mask.GetPaths()[0] != "spec.node_sets."+changedNodeSet+".version") {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"node-set version changes require a mask containing only spec.node_sets.%s.version", changedNodeSet)
 	}
 	return nil
 }
@@ -928,14 +953,19 @@ func (s *PrivateClustersServer) updateAffectsNodeSets(updateMask *fieldmaskpb.Fi
 
 // isUpdatingOnlySizes checks if the update mask is only modifying size fields of node sets.
 func (s *PrivateClustersServer) isUpdatingOnlySizes(updateMask *fieldmaskpb.FieldMask) bool {
+	if len(updateMask.GetPaths()) == 0 {
+		return true
+	}
+	hasSize := false
 	for _, path := range updateMask.GetPaths() {
-		if strings.HasPrefix(path, "spec.node_sets") {
+		if path == "spec" || strings.HasPrefix(path, "spec.node_sets") {
 			if !strings.HasSuffix(path, ".size") {
 				return false
 			}
+			hasSize = true
 		}
 	}
-	return true
+	return hasSize
 }
 
 // validateAtLeastOneNodeSet ensures that clusters always have at least one node set.
@@ -1105,6 +1135,19 @@ func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 	if err != nil || !found {
 		return err
 	}
+	for _, path := range mask.GetPaths() {
+		if !strings.HasPrefix(path, "spec.node_sets.") || !strings.HasSuffix(path, ".version") {
+			continue
+		}
+		if len(mask.GetPaths()) != 1 {
+			return grpcstatus.Error(grpccodes.InvalidArgument,
+				"a node-set version update cannot include other fields")
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(path, "spec.node_sets."), ".version")
+		if existing.GetSpec().GetNodeSets()[name] == nil {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
+		}
+	}
 	if controlPlaneUpdated {
 		version, err := s.validateVersionReferenceUpdate(ctx, existing.GetMetadata(),
 			existing.GetSpec().GetVersion(), newSpec.GetVersion())
@@ -1121,13 +1164,22 @@ func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 
 func (s *PrivateClustersServer) validateNodeSetVersionUpdates(ctx context.Context,
 	existing *privatev1.Cluster, newSpec *privatev1.ClusterSpec) error {
+	controlPlaneVersion := existing.GetSpec().GetVersion()
 	for name, nodeSet := range newSpec.GetNodeSets() {
-		if nodeSet == nil || refKey(nodeSet.GetVersion()) == "" {
+		if nodeSet == nil {
 			continue
 		}
 		storedNodeSet := existing.GetSpec().GetNodeSets()[name]
 		if storedNodeSet == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
+			version, err := s.validateNewNodeSetVersion(ctx, existing.GetMetadata(), controlPlaneVersion, nodeSet.GetVersion(), name)
+			if err != nil {
+				return err
+			}
+			nodeSet.SetVersion(version)
+			continue
+		}
+		if refKey(nodeSet.GetVersion()) == "" {
+			continue
 		}
 		stored := storedNodeSet.GetVersion()
 		legacy := refKey(stored) == ""
@@ -1145,6 +1197,19 @@ func (s *PrivateClustersServer) validateNodeSetVersionUpdates(ctx context.Contex
 		}
 	}
 	return nil
+}
+
+func (s *PrivateClustersServer) validateNewNodeSetVersion(ctx context.Context, owner *privatev1.Metadata,
+	controlPlaneVersion, selected *privatev1.ClusterVersionReference, name string) (*privatev1.ClusterVersionReference, error) {
+	version, err := s.validateVersionReferenceUpdate(ctx, owner, controlPlaneVersion, selected)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpcstatus.Code(err), "node set '%s': %s", name, grpcstatus.Convert(err).Message())
+	}
+	if !sameClusterVersionReference(controlPlaneVersion, version) {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"node set '%s': version must match the control-plane version", name)
+	}
+	return version, nil
 }
 
 // validateVersionReferenceUpdate preserves an omitted or unchanged selection;
