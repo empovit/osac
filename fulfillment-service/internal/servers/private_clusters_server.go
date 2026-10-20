@@ -29,7 +29,6 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -346,12 +345,8 @@ func (s *PrivateClustersServer) prepareCreate(ctx context.Context, candidate *pr
 	if err != nil {
 		return
 	}
-	for name, nodeSet := range spec.GetNodeSets() {
-		version, err := s.validateNewNodeSetVersion(ctx, candidate.GetMetadata(), spec.GetVersion(), nodeSet.GetVersion(), name)
-		if err != nil {
-			return err
-		}
-		nodeSet.SetVersion(version)
+	if err := s.validateCreatedNodeSetVersions(ctx, candidate); err != nil {
+		return err
 	}
 	if key := spec.GetSshPublicKey(); key != "" {
 		if err = validateOpenSSHPublicKey(key); err != nil {
@@ -408,180 +403,104 @@ func (s *PrivateClustersServer) resolveCreationSource(ctx context.Context,
 
 func (s *PrivateClustersServer) Update(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) (response *privatev1.ClustersUpdateResponse, err error) {
-	err = s.validateNoDuplicateConditions(request.GetObject())
-	if err != nil {
+	if err = s.validateNoDuplicateConditions(request.GetObject()); err != nil {
 		return
 	}
-	err = s.validateClusterStateForSpecUpdate(ctx, request)
-	if err != nil {
+	if err = s.validateClusterStateForSpecUpdate(ctx, request); err != nil {
 		return
 	}
 	// Version validation canonicalizes selected references; keep the caller's request intact.
 	request = proto.Clone(request).(*privatev1.ClustersUpdateRequest)
-	err = s.validateVersionUpdate(ctx, request)
-	if err != nil {
+	if err = s.validateClusterUpdateRequest(ctx, request); err != nil {
 		return
 	}
-	err = s.validateNodeSetsUpdate(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateAutoExternalIPImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateSpecUpdateRequest(request)
-	if err != nil {
-		return
-	}
-
-	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context, current *privatev1.Cluster, candidate *privatev1.Cluster) error {
-		if err := validateClusterEndpointAddresses(candidate.GetStatus(), request.GetUpdateMask()); err != nil {
-			return err
-		}
-		if err := validateClusterNetworkAttachmentImmutability(current, candidate, request.GetUpdateMask()); err != nil {
-			return err
-		}
-		if err := validateClusterTemplateImmutability(current, candidate, request.GetUpdateMask()); err != nil {
-			return err
-		}
-		mask := request.GetUpdateMask()
-		sizeOnlyNodeSets := len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)
-		if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate,
-			request.GetObject().GetSpec().GetNodeSets(), mask, sizeOnlyNodeSets); err != nil {
-			return err
-		}
-		controlPlaneChanged := pinUnsetNodeSetVersionsForUpdate(current, candidate, mask)
-		if err := validateExclusiveVersionUpdate(current, candidate, mask); err != nil {
-			return err
-		}
-		if controlPlaneChanged {
-			// Metering splits control-plane version usage at acceptance time, so stamp it in
-			// the same transaction that applies the new control-plane version. An unchanged
-			// selection keeps its stored reference and does not re-stamp.
-			if !candidate.HasStatus() {
-				candidate.SetStatus(privatev1.ClusterStatus_builder{}.Build())
-			}
-			candidate.GetStatus().SetVersionTransitionTime(timestamppb.Now())
-		}
-		if updateIncludesField(mask, "spec.ssh_public_key") {
-			if key := candidate.GetSpec().GetSshPublicKey(); key != "" {
-				if err := validateOpenSSHPublicKey(key); err != nil {
-					return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.ssh_public_key: %s", err)
-				}
-			}
-		}
-		if err := s.validateAddOnOperatorImmutability(current, candidate, mask); err != nil {
-			return err
-		}
-		if err := utils.ValidateClusterSpecFields(candidate.GetSpec()); err != nil {
-			return err
-		}
-		// An explicit size-only update keeps the existing hardware type and fabric interface.
-		// Re-resolving here would prevent scaling legacy clusters with tenant-scoped BMITs.
-		if s.updateAffectsNodeSets(mask) && candidate.GetSpec().GetNetworkAttachment() != nil && !sizeOnlyNodeSets {
-			if err := s.resolveFabricInterfaces(ctx, candidate); err != nil {
-				return err
-			}
-		}
-		if updateIncludesField(request.GetUpdateMask(), "spec.network_attachment.security_groups") {
-			if err := s.validateNetworkAttachmentState(ctx, candidate); err != nil {
-				return err
-			}
-		}
-		if !proto.Equal(current.GetSpec().GetPullSecretSecret(), candidate.GetSpec().GetPullSecretSecret()) {
-			ref := candidate.GetSpec().GetPullSecretSecret()
-			allowShared := ref.GetId() != "" && ref.GetId() == current.GetSpec().GetPullSecretSecret().GetId()
-			if err := s.validatePullSecretSecret(ctx, candidate, allowShared); err != nil {
-				return err
-			}
-		}
-		return nil
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context,
+		current, candidate *privatev1.Cluster) error {
+		return s.prepareUpdatedCluster(ctx, current, candidate, request)
 	})
 	return
 }
 
-func populateUnsetNodeSetVersions(nodeSets map[string]*privatev1.ClusterNodeSet, version *privatev1.ClusterVersionReference) {
-	if version == nil {
-		return
+func (s *PrivateClustersServer) validateClusterUpdateRequest(ctx context.Context,
+	request *privatev1.ClustersUpdateRequest) error {
+	if err := s.validateVersionUpdate(ctx, request); err != nil {
+		return err
 	}
-	for _, nodeSet := range nodeSets {
-		if nodeSet != nil && refKey(nodeSet.GetVersion()) == "" {
-			nodeSet.SetVersion(cloneMessage(version))
-		}
+	if err := s.validateNodeSetsUpdate(ctx, request); err != nil {
+		return err
 	}
+	if err := s.validateAutoExternalIPImmutability(ctx, request); err != nil {
+		return err
+	}
+	return s.validateSpecUpdateRequest(request)
 }
 
-// pinUnsetNodeSetVersionsForUpdate preserves the established control-plane
-// version for node sets that have no stored version of their own.
-func pinUnsetNodeSetVersionsForUpdate(current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask) bool {
-	versionOnlyNodeSet := len(mask.GetPaths()) == 1 &&
-		strings.HasPrefix(mask.GetPaths()[0], "spec.node_sets.") &&
-		strings.HasSuffix(mask.GetPaths()[0], ".version")
-	controlPlaneChanged := updateIncludesField(mask, "spec.version") &&
-		!sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion())
-	if (updateIncludesField(mask, "spec.node_sets") && !versionOnlyNodeSet) || controlPlaneChanged {
-		populateUnsetNodeSetVersions(candidate.GetSpec().GetNodeSets(), current.GetSpec().GetVersion())
+func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, current, candidate *privatev1.Cluster,
+	request *privatev1.ClustersUpdateRequest) error {
+	if err := validateClusterEndpointAddresses(candidate.GetStatus(), request.GetUpdateMask()); err != nil {
+		return err
 	}
-	return controlPlaneChanged
+	if err := validateClusterNetworkAttachmentImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+		return err
+	}
+	if err := validateClusterTemplateImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+		return err
+	}
+	mask := request.GetUpdateMask()
+	sizeOnlyNodeSets := len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)
+	if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate,
+		request.GetObject().GetSpec().GetNodeSets(), mask, sizeOnlyNodeSets); err != nil {
+		return err
+	}
+	if err := prepareClusterVersionChange(current, candidate, mask); err != nil {
+		return err
+	}
+	if err := s.validateUpdatedClusterSpec(current, candidate, mask); err != nil {
+		return err
+	}
+	return s.prepareUpdatedClusterReferences(ctx, current, candidate, mask, sizeOnlyNodeSets)
 }
 
-// validateExclusiveVersionUpdate allows one existing component's version to
-// change per edit. A node-set version change cannot share an edit with a size
-// change. A legacy node set without a stored version already follows the stored
-// control-plane version; pinning that baseline is not an upgrade.
-func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask) error {
-	changes := 0
-	sizeChanged := false
-	changedNodeSet := ""
-	if !sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
-		changes++
-	}
-	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
-		stored, exists := current.GetSpec().GetNodeSets()[name]
-		if !exists || nodeSet == nil {
-			continue
-		}
-		if stored.GetSize() != nodeSet.GetSize() || stored.HasSize() != nodeSet.HasSize() {
-			sizeChanged = true
-		}
-		baseline := stored.GetVersion()
-		if refKey(baseline) == "" {
-			baseline = current.GetSpec().GetVersion()
-		}
-		target := nodeSet.GetVersion()
-		if refKey(target) == "" {
-			continue
-		}
-		if !sameClusterVersionReference(baseline, target) {
-			changes++
-			changedNodeSet = name
-			if changes > 1 {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"only one component version can be changed per edit: control plane or one node set")
+func (s *PrivateClustersServer) validateUpdatedClusterSpec(current, candidate *privatev1.Cluster,
+	mask *fieldmaskpb.FieldMask) error {
+	if updateIncludesField(mask, "spec.ssh_public_key") {
+		if key := candidate.GetSpec().GetSshPublicKey(); key != "" {
+			if err := validateOpenSSHPublicKey(key); err != nil {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.ssh_public_key: %s", err)
 			}
 		}
 	}
-	if changedNodeSet != "" && sizeChanged {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"node-set size and node-set version cannot be changed in the same update")
+	if err := s.validateAddOnOperatorImmutability(current, candidate, mask); err != nil {
+		return err
 	}
-	if changedNodeSet != "" && (len(mask.GetPaths()) != 1 ||
-		mask.GetPaths()[0] != "spec.node_sets."+changedNodeSet+".version") {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"node-set version changes require a mask containing only spec.node_sets.%s.version", changedNodeSet)
+	if err := utils.ValidateClusterSpecFields(candidate.GetSpec()); err != nil {
+		return err
 	}
 	return nil
 }
 
-func sameClusterVersionReference(a, b *privatev1.ClusterVersionReference) bool {
-	if a.GetId() != "" && b.GetId() != "" {
-		return a.GetId() == b.GetId()
+func (s *PrivateClustersServer) prepareUpdatedClusterReferences(ctx context.Context,
+	current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool) error {
+	// An explicit size-only update keeps the existing hardware type and fabric interface.
+	// Re-resolving here would prevent scaling legacy clusters with tenant-scoped BMITs.
+	if s.updateAffectsNodeSets(mask) && candidate.GetSpec().GetNetworkAttachment() != nil && !sizeOnlyNodeSets {
+		if err := s.resolveFabricInterfaces(ctx, candidate); err != nil {
+			return err
+		}
 	}
-	if a.GetName() != "" && b.GetName() != "" {
-		return a.GetName() == b.GetName()
+	if updateIncludesField(mask, "spec.network_attachment.security_groups") {
+		if err := s.validateNetworkAttachmentState(ctx, candidate); err != nil {
+			return err
+		}
 	}
-	return refKey(a) == refKey(b)
+	if !proto.Equal(current.GetSpec().GetPullSecretSecret(), candidate.GetSpec().GetPullSecretSecret()) {
+		ref := candidate.GetSpec().GetPullSecretSecret()
+		allowShared := ref.GetId() != "" && ref.GetId() == current.GetSpec().GetPullSecretSecret().GetId()
+		if err := s.validatePullSecretSecret(ctx, candidate, allowShared); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // prepareUpdatedClusterNodeSets preserves stored fields for nested node-set
@@ -597,78 +516,19 @@ func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
 	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
 		existing := current.GetSpec().GetNodeSets()[name]
 		if partialSizeOrVersionUpdate {
-			if existing == nil {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
-			}
-			// Each masked map path replaces its entry, so read all selected fields
-			// from the request before rebuilding the complete stored node set.
-			selected := requestedNodeSets[name]
-			selectedVersion := selected.GetVersion()
-			selectedSize, hasSelectedSize := selected.GetSize(), selected.HasSize()
-			nodeSet = cloneMessage(existing)
-			if updateIncludesField(mask, "spec.node_sets."+name+".version") {
-				nodeSet.SetVersion(selectedVersion)
-			}
-			if updateIncludesField(mask, "spec.node_sets."+name+".size") {
-				if hasSelectedSize {
-					nodeSet.SetSize(selectedSize)
-				} else {
-					nodeSet.ClearSize()
-				}
+			var err error
+			nodeSet, err = restoreMaskedNodeSetFields(name, existing, requestedNodeSets[name], mask)
+			if err != nil {
+				return err
 			}
 			candidate.GetSpec().GetNodeSets()[name] = nodeSet
 		}
-		if nodeSet != nil && refKey(nodeSet.GetVersion()) == "" {
-			version := current.GetSpec().GetVersion()
-			if existing != nil {
-				version = existing.GetVersion()
-			}
-			if version != nil {
-				nodeSet.SetVersion(cloneMessage(version))
-			}
-		}
-		if sizeOnlyNodeSets && existing == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"node_sets.%s.baremetal_instance_type is required when adding a node set with a size-only update", name)
-		}
-		if existing != nil &&
-			(refKey(existing.GetBaremetalInstanceType()) == refKey(nodeSet.GetBaremetalInstanceType()) ||
-				(s.isUpdatingOnlySizes(mask) && refKey(nodeSet.GetBaremetalInstanceType()) == "")) {
-			// Keep the stored hardware reference when unchanged. Size-only masks
-			// also need the stored fabric interface.
-			nodeSet.SetBaremetalInstanceType(cloneMessage(existing.GetBaremetalInstanceType()))
-			if sizeOnlyNodeSets {
-				nodeSet.SetFabricInterface(existing.GetFabricInterface())
-			}
-			continue
-		}
-		ref := nodeSet.GetBaremetalInstanceType()
-		if refKey(ref) == "" {
-			continue
-		}
-		kind := "node_sets." + name + ".baremetal_instance_type"
-		resolved, err := getReferenceResource(ctx, s.bareMetalInstanceTypesDao, ref.GetId())
-		if err != nil {
-			return resourceLookupError(err, kind, ref.GetId(), "", grpccodes.InvalidArgument)
-		}
-		if err := validateResourceNotDeleted(kind, refKey(ref), "", resolved.GetMetadata()); err != nil {
+		retainOmittedNodeSetVersion(current.GetSpec().GetVersion(), existing, nodeSet)
+		if err := s.prepareUpdatedNodeSetHardware(ctx, name, existing, nodeSet, mask, sizeOnlyNodeSets); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func isUpdatingOnlyNodeSizeOrVersionFields(mask *fieldmaskpb.FieldMask) bool {
-	if len(mask.GetPaths()) == 0 {
-		return false
-	}
-	for _, path := range mask.GetPaths() {
-		if !strings.HasPrefix(path, "spec.node_sets.") ||
-			(!strings.HasSuffix(path, ".size") && !strings.HasSuffix(path, ".version")) {
-			return false
-		}
-	}
-	return true
 }
 
 func (s *PrivateClustersServer) validateSpecUpdateRequest(request *privatev1.ClustersUpdateRequest) error {
@@ -1114,127 +974,6 @@ func (s *PrivateClustersServer) validateAddOnOperatorImmutability(
 	}
 	candidate.GetSpec().SetAddOnOperators(cloneCurrent())
 	return nil
-}
-
-// validateVersionUpdate uses the existing control-plane catalog checks for
-// changed control-plane and node-set selections. Unset legacy node-set versions
-// use the stored control-plane version for comparison.
-func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
-	request *privatev1.ClustersUpdateRequest) error {
-	mask := request.GetUpdateMask()
-	controlPlaneUpdated := updateIncludesField(mask, "spec.version")
-	nodeSetsUpdated := s.updateAffectsNodeSets(mask)
-	if !controlPlaneUpdated && !nodeSetsUpdated {
-		return nil
-	}
-	newSpec := request.GetObject().GetSpec()
-	if newSpec == nil {
-		return nil
-	}
-	existing, found, err := s.getExistingCluster(ctx, request)
-	if err != nil || !found {
-		return err
-	}
-	for _, path := range mask.GetPaths() {
-		if !strings.HasPrefix(path, "spec.node_sets.") || !strings.HasSuffix(path, ".version") {
-			continue
-		}
-		if len(mask.GetPaths()) != 1 {
-			return grpcstatus.Error(grpccodes.InvalidArgument,
-				"a node-set version update cannot include other fields")
-		}
-		name := strings.TrimSuffix(strings.TrimPrefix(path, "spec.node_sets."), ".version")
-		if existing.GetSpec().GetNodeSets()[name] == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
-		}
-	}
-	if controlPlaneUpdated {
-		version, err := s.validateVersionReferenceUpdate(ctx, existing.GetMetadata(),
-			existing.GetSpec().GetVersion(), newSpec.GetVersion())
-		if err != nil {
-			return err
-		}
-		newSpec.SetVersion(version)
-	}
-	if !nodeSetsUpdated || (len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)) {
-		return nil
-	}
-	return s.validateNodeSetVersionUpdates(ctx, existing, newSpec)
-}
-
-func (s *PrivateClustersServer) validateNodeSetVersionUpdates(ctx context.Context,
-	existing *privatev1.Cluster, newSpec *privatev1.ClusterSpec) error {
-	controlPlaneVersion := existing.GetSpec().GetVersion()
-	for name, nodeSet := range newSpec.GetNodeSets() {
-		if nodeSet == nil {
-			continue
-		}
-		storedNodeSet := existing.GetSpec().GetNodeSets()[name]
-		if storedNodeSet == nil {
-			version, err := s.validateNewNodeSetVersion(ctx, existing.GetMetadata(), controlPlaneVersion, nodeSet.GetVersion(), name)
-			if err != nil {
-				return err
-			}
-			nodeSet.SetVersion(version)
-			continue
-		}
-		if refKey(nodeSet.GetVersion()) == "" {
-			continue
-		}
-		stored := storedNodeSet.GetVersion()
-		legacy := refKey(stored) == ""
-		if legacy {
-			stored = existing.GetSpec().GetVersion()
-		}
-		version, err := s.validateVersionReferenceUpdate(ctx, existing.GetMetadata(), stored, nodeSet.GetVersion())
-		if err != nil {
-			return grpcstatus.Errorf(grpcstatus.Code(err), "node set '%s': %s", name, grpcstatus.Convert(err).Message())
-		}
-		if legacy && sameClusterVersionReference(stored, version) {
-			nodeSet.SetVersion(nil)
-		} else {
-			nodeSet.SetVersion(version)
-		}
-	}
-	return nil
-}
-
-func (s *PrivateClustersServer) validateNewNodeSetVersion(ctx context.Context, owner *privatev1.Metadata,
-	controlPlaneVersion, selected *privatev1.ClusterVersionReference, name string) (*privatev1.ClusterVersionReference, error) {
-	version, err := s.validateVersionReferenceUpdate(ctx, owner, controlPlaneVersion, selected)
-	if err != nil {
-		return nil, grpcstatus.Errorf(grpcstatus.Code(err), "node set '%s': %s", name, grpcstatus.Convert(err).Message())
-	}
-	if !sameClusterVersionReference(controlPlaneVersion, version) {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"node set '%s': version must match the control-plane version", name)
-	}
-	return version, nil
-}
-
-// validateVersionReferenceUpdate preserves an omitted or unchanged selection;
-// changed selections use the same catalog lookup for control planes and node sets.
-func (s *PrivateClustersServer) validateVersionReferenceUpdate(ctx context.Context,
-	owner *privatev1.Metadata, stored, selected *privatev1.ClusterVersionReference,
-) (*privatev1.ClusterVersionReference, error) {
-	if refKey(selected) == "" || sameClusterVersionReference(stored, selected) {
-		if stored == nil {
-			return nil, nil
-		}
-		return cloneMessage(stored), nil
-	}
-	version, err := resolveAndCanonicalizeReference(ctx, s.clusterVersionsDao, owner,
-		selected, "version", grpccodes.InvalidArgument)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateResolvedClusterVersion(version, version.GetMetadata().GetName(), ""); err != nil {
-		return nil, err
-	}
-	if sameClusterVersionReference(stored, selected) {
-		return cloneMessage(stored), nil
-	}
-	return selected, nil
 }
 
 // validateClusterNetworkAttachmentImmutability rejects changes to the complete
