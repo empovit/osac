@@ -2219,6 +2219,31 @@ var _ = Describe("Private clusters server", func() {
 			Expect(status.Message()).To(Equal("cannot change baremetal_instance_type for node set 'compute' from 'acme-bmit-id' to 'acme-gpu-bmit-id': baremetal_instance_type is immutable"))
 		})
 
+		It("Rejects changing baremetal_instance_type in a full-object update", func() {
+			created, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: "immutable-hardware-full-update"}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			original := created.GetObject()
+			updated := proto.Clone(original).(*privatev1.Cluster)
+			updated.GetSpec().GetNodeSets()["compute"].SetBaremetalInstanceType(
+				privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build())
+
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: updated}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring(
+				"cannot change baremetal_instance_type for node set 'compute'"))
+
+			stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: original.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(stored.GetObject().GetSpec(), original.GetSpec())).To(BeTrue())
+		})
+
 		It("Allows changing size of an existing node set", func() {
 			// Create a cluster with the default node sets from the template
 			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{

@@ -30,6 +30,15 @@ func (s *PrivateClustersServer) prepareUpdatedNodeSetHardware(ctx context.Contex
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"node_sets.%s.baremetal_instance_type is required when adding a node set with a size-only update", name)
 	}
+	if existing != nil {
+		existingKey := refKey(existing.GetBaremetalInstanceType())
+		updatedKey := refKey(nodeSet.GetBaremetalInstanceType())
+		if updatedKey != "" && updatedKey != existingKey {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+				"cannot change baremetal_instance_type for node set '%s' from '%s' to '%s': baremetal_instance_type is immutable",
+				name, existingKey, updatedKey)
+		}
+	}
 	if existing != nil &&
 		(refKey(existing.GetBaremetalInstanceType()) == refKey(nodeSet.GetBaremetalInstanceType()) ||
 			(s.isUpdatingOnlySizes(mask) && refKey(nodeSet.GetBaremetalInstanceType()) == "")) {
