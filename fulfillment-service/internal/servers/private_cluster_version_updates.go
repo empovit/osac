@@ -150,10 +150,7 @@ func sameClusterVersionReference(a, b *privatev1.ClusterVersionReference) bool {
 	if a.GetId() != "" && b.GetId() != "" {
 		return a.GetId() == b.GetId()
 	}
-	if a.GetName() != "" && b.GetName() != "" {
-		return a.GetName() == b.GetName()
-	}
-	return refKey(a) == refKey(b)
+	return a.GetName() == b.GetName()
 }
 
 // validateVersionUpdate uses the existing control-plane catalog checks for
