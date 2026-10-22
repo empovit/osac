@@ -45,7 +45,13 @@ func recordUpgradeObservations(order *v1alpha1.ClusterOrder,
 			continue
 		}
 		if request := requestsByNodeSet[nodeSet]; request != nil {
-			request.UpgradeObservation = nodePoolUpgradeObservation(order, pool, nodeSet, ids.NodeSets[nodeSet])
+			id := ids.NodeSets[nodeSet]
+			if id == "" && !nodeSetRequested(order, nodeSet) {
+				// A removed NodeSet has no current ID on the order, but its
+				// NodePool can still report the attempt stamped before removal.
+				id = pool.Annotations[v1alpha1.UpgradeAttemptIDAnnotation]
+			}
+			request.UpgradeObservation = nodePoolUpgradeObservation(order, pool, nodeSet, id)
 		}
 	}
 }
@@ -72,10 +78,20 @@ func controlPlaneUpgradeObservation(order *v1alpha1.ClusterOrder,
 func nodePoolUpgradeObservation(order *v1alpha1.ClusterOrder,
 	pool *hypershiftv1beta1.NodePool, nodeSet, id string) *v1alpha1.UpgradeObservation {
 	if id == "" || pool.Annotations[v1alpha1.UpgradeAttemptIDAnnotation] != id ||
-		pool.Status.Version == "" || !nodePoolReleaseMatchesOrder(order, nodeSet, pool.Spec.Release.Image) {
+		pool.Status.Version == "" ||
+		(nodeSetRequested(order, nodeSet) && !nodePoolReleaseMatchesOrder(order, nodeSet, pool.Spec.Release.Image)) {
 		return nil
 	}
 	return &v1alpha1.UpgradeObservation{AttemptID: id, Version: pool.Status.Version}
+}
+
+func nodeSetRequested(order *v1alpha1.ClusterOrder, nodeSet string) bool {
+	for _, request := range order.Spec.NodeRequests {
+		if request.NodeSet == nodeSet {
+			return true
+		}
+	}
+	return false
 }
 
 func nodePoolReleaseMatchesOrder(order *v1alpha1.ClusterOrder, nodeSet, image string) bool {

@@ -1398,6 +1398,7 @@ var _ = Describe("Private clusters server", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()).To(HaveLen(1))
 			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()[0].GetName()).To(Equal("operator-one"))
+			Expect(proto.Equal(updateResponse.GetObject().GetSpec(), createResponse.GetObject().GetSpec())).To(BeTrue())
 		})
 
 		It("preserves add-on operators when the referenced operator is deleted", func() {
@@ -5257,6 +5258,8 @@ var _ = Describe("Private clusters server", func() {
 				Expect(merged[0].GetAttemptId()).To(Equal(compute.GetSpec().GetNodeSetAttemptIds()["compute"]))
 				Expect(merged[1].GetAttemptId()).To(Equal(cpID))
 				Expect(merged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
+				Expect(proto.Equal(merged[1].GetComponent(), history[1].GetComponent())).To(BeTrue())
+				Expect(proto.Equal(merged[1].GetAcceptedTime(), history[1].GetAcceptedTime())).To(BeTrue())
 			})
 
 			It("preserves server-owned attempt IDs on full-object and parent-spec edits", func() {

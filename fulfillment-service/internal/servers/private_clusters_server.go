@@ -419,10 +419,12 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 	if err = s.validateClusterUpdateRequest(ctx, request); err != nil {
 		return
 	}
-	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context,
+	// Upgrade-history updates contain only the changed state, time, and attempt ID.
+	// Merge the stored audit fields before validating the completed candidate.
+	err = s.generic.updateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context,
 		current, candidate *privatev1.Cluster) error {
 		return s.prepareUpdatedCluster(ctx, current, candidate, request)
-	})
+	}, true)
 	return
 }
 
@@ -442,6 +444,11 @@ func (s *PrivateClustersServer) validateClusterUpdateRequest(ctx context.Context
 
 func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, current, candidate *privatev1.Cluster,
 	request *privatev1.ClustersUpdateRequest) error {
+	// An unmasked metadata-only request omits spec. Keep the stored spec so its
+	// version and node sets are not interpreted as a metering-relevant change.
+	if request.GetUpdateMask() == nil && request.GetObject().GetSpec() == nil && current.GetSpec() != nil {
+		candidate.SetSpec(proto.Clone(current.GetSpec()).(*privatev1.ClusterSpec))
+	}
 	if err := validateClusterEndpointAddresses(candidate.GetStatus(), request.GetUpdateMask()); err != nil {
 		return err
 	}

@@ -377,6 +377,9 @@ enum ClusterUpgradeState {
 
   // HyperShift reported a terminal error and stopped working toward the requested version.
   CLUSTER_UPGRADE_STATE_FAILED = 5;
+
+  // The node set was removed and its NodePool deleted before the upgrade completed.
+  CLUSTER_UPGRADE_STATE_NODE_SET_REMOVED = 6;
 }
 
 // Identifies the control plane or a node set within the Cluster being upgraded.

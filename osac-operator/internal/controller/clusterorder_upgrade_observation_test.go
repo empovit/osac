@@ -14,12 +14,18 @@ language governing permissions and limitations under the License.
 package controller
 
 import (
+	"context"
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	configv1 "github.com/openshift/api/config/v1"
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -136,5 +142,71 @@ var _ = Describe("upgrade attempt correlation", func() {
 		Expect(remote.GetStatus().GetObservedCpVersion()).To(Equal("4.18.0"))
 		Expect(remote.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(Equal("4.17.0"))
 		Expect(remote.GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.16.0"))
+	})
+
+	It("observes a removed NodeSet while its stamped NodePool still exists", func() {
+		order := newOrder()
+		order.Spec.NodeRequests = order.Spec.NodeRequests[:1]
+		order.Annotations[v1alpha1.UpgradeAttemptIDsAnnotation] = `{"nodeSets":{"compute":"compute-id"}}`
+		pool := newPool("gpu", "gpu-id")
+		recordUpgradeObservations(order, &hypershiftv1beta1.HostedCluster{}, []hypershiftv1beta1.NodePool{pool})
+		Expect(order.Status.NodeRequests[1].UpgradeObservation).To(Equal(
+			&v1alpha1.UpgradeObservation{AttemptID: "gpu-id", Version: "4.17.0"}))
+	})
+
+	It("retains a removed NodeSet until its NodePool is absent from a successful list", func() {
+		order := newOrder()
+		order.Name = "order"
+		order.Spec.NodeRequests = order.Spec.NodeRequests[:1]
+		order.Status.ClusterReference = &v1alpha1.ClusterOrderClusterReferenceType{Namespace: "cluster-namespace"}
+		pool := newPool("gpu", "gpu-id")
+		pool.Name = "nodepool-order-gpu"
+		pool.Namespace = "cluster-namespace"
+		pool.Labels[osacClusterOrderNameLabel] = order.Name
+		pool.Labels[agentInstanceTypeLabel] = "bm.gpu"
+		pool.Status.Replicas = 1
+		scheme := runtime.NewScheme()
+		Expect(hypershiftv1beta1.AddToScheme(scheme)).To(Succeed())
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&pool).Build()
+		remote := &privatev1.Cluster{}
+		remote.SetSpec(privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{"compute": {}}}.Build())
+		entry := &privatev1.ClusterUpgradeHistoryEntry{}
+		entry.SetAttemptId("gpu-id")
+		component := &privatev1.ClusterUpgradeComponent{}
+		component.SetNodeSetId("gpu")
+		entry.SetComponent(component)
+		entry.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING)
+		entry.SetLastStateTime(timestamppb.New(time.Now().Add(-time.Minute)))
+		status := &privatev1.ClusterStatus{}
+		status.SetNodeSets(map[string]*privatev1.ClusterNodeSet{"compute": {}, "gpu": {}})
+		status.GetNodeSets()["gpu"].SetObservedVersion("4.16.0")
+		status.SetUpgradeHistory([]*privatev1.ClusterUpgradeHistoryEntry{entry})
+		remote.SetStatus(status)
+		reconciler := &ClusterOrderReconciler{}
+		Expect(reconciler.handleNodePools(context.Background(), order,
+			&hypershiftv1beta1.NodePoolList{Items: []hypershiftv1beta1.NodePool{pool}})).To(Succeed())
+		Expect(order.Status.NodeRequests).To(HaveLen(2))
+		Expect(syncRemovedNodeSetUpgrades(context.Background(), client, order, remote)).To(Succeed())
+		Expect(remote.GetStatus().GetNodeSets()).To(HaveKey("gpu"))
+		Expect(entry.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+		order.Status.NodeRequests[1].UpgradeObservation = &v1alpha1.UpgradeObservation{
+			AttemptID: "gpu-id", Version: "4.17.0",
+		}
+		syncClusterOrderUpgradeObservations(order, remote)
+		Expect(remote.GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.17.0"))
+		order.Status.NodeRequests[1].UpgradeObservation.AttemptID = "stale-id"
+		order.Status.NodeRequests[1].UpgradeObservation.Version = "4.18.0"
+		syncClusterOrderUpgradeObservations(order, remote)
+		Expect(remote.GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.17.0"))
+
+		Expect(client.Delete(context.Background(), &pool)).To(Succeed())
+		Expect(reconciler.handleNodePools(context.Background(), order, &hypershiftv1beta1.NodePoolList{})).To(Succeed())
+		Expect(order.Status.NodeRequests).To(HaveLen(1))
+		Expect(order.Status.NodeRequests[0].NodeSet).To(Equal("compute"))
+		Expect(syncRemovedNodeSetUpgrades(context.Background(), client, order, remote)).To(Succeed())
+		Expect(remote.GetStatus().GetNodeSets()).NotTo(HaveKey("gpu"))
+		Expect(entry.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_NODE_SET_REMOVED))
+		Expect(entry.GetMessage()).To(ContainSubstring("gpu"))
+		Expect(entry.GetLastStateTime().AsTime()).To(BeTemporally(">", time.Now().Add(-time.Minute)))
 	})
 })

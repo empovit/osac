@@ -827,12 +827,27 @@ func reconcileVIPEndpoints(instance *v1alpha1.ClusterOrder) {
 
 func (r *ClusterOrderReconciler) handleNodePools(ctx context.Context, instance *v1alpha1.ClusterOrder,
 	nodePools *hypershiftv1beta1.NodePoolList) error {
+	present := make(map[string]bool, len(nodePools.Items))
 	for i := range len(nodePools.Items) {
+		if name, ok := nodePoolNodeSet(&nodePools.Items[i]); ok {
+			present[name] = true
+		}
 		err := r.handleNodePool(ctx, instance, &nodePools.Items[i])
 		if err != nil {
 			return fmt.Errorf("failed to handle node pool %d: %w", i, err)
 		}
 	}
+	desired := make(map[string]bool, len(instance.Spec.NodeRequests))
+	for _, request := range instance.Spec.NodeRequests {
+		desired[request.NodeSet] = true
+	}
+	retained := instance.Status.NodeRequests[:0]
+	for _, request := range instance.Status.NodeRequests {
+		if desired[request.NodeSet] || present[request.NodeSet] {
+			retained = append(retained, request)
+		}
+	}
+	instance.Status.NodeRequests = retained
 	return nil
 }
 
