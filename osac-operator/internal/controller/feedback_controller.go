@@ -108,7 +108,7 @@ func newClusterOrderFeedbackBridge(hubClient clnt.Client, clustersClient private
 				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
 					feedbackStatusConditionsPath, feedbackStatusStatePath, "status.api_url", "status.console_url", "status.api_endpoint",
 					"status.ingress_endpoint", feedbackStatusStateTransitionTimePath, "status.kubeconfig_secret", "status.password_secret", "status.hub",
-					"status.node_sets", "status.add_on_operators",
+					"status.node_sets", "status.observed_cp_version", "status.add_on_operators",
 				}},
 			}.Build())
 			return err
@@ -135,10 +135,58 @@ func newClusterOrderSyncUpdate(hubClient clnt.Client) func(context.Context, *ckv
 			return err
 		}
 		syncClusterOrderNodeRequests(ctx, clusterOrder, remote)
+		syncClusterOrderUpgradeObservations(clusterOrder, remote)
 		syncClusterOrderAddOnOperators(clusterOrder, remote)
 		syncClusterOrderVIPEndpoints(clusterOrder, remote)
 		return nil
 	}
+}
+
+func syncClusterOrderUpgradeObservations(order *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) {
+	syncControlPlaneUpgradeObservation(order.Status.UpgradeObservation, remote)
+	for _, request := range order.Status.NodeRequests {
+		syncNodeSetUpgradeObservation(request, remote)
+	}
+}
+
+func syncControlPlaneUpgradeObservation(observation *ckv1alpha1.UpgradeObservation, remote *privatev1.Cluster) {
+	if observation != nil && observation.Version != "" &&
+		observation.AttemptID != "" && observation.AttemptID == remote.GetSpec().GetControlPlaneAttemptId() &&
+		matchesControlPlaneUpgradeHistory(remote.GetStatus().GetUpgradeHistory(), observation.AttemptID) {
+		remote.GetStatus().SetObservedCpVersion(observation.Version)
+	}
+}
+
+func syncNodeSetUpgradeObservation(request ckv1alpha1.NodeRequestStatus, remote *privatev1.Cluster) {
+	observation := request.UpgradeObservation
+	if observation == nil || observation.Version == "" || observation.AttemptID == "" {
+		return
+	}
+	if remote.GetSpec().GetNodeSetAttemptIds()[request.NodeSet] != observation.AttemptID ||
+		!matchesNodeSetUpgradeHistory(remote.GetStatus().GetUpgradeHistory(), observation.AttemptID, request.NodeSet) {
+		return
+	}
+	if nodeSet := remote.GetStatus().GetNodeSets()[request.NodeSet]; nodeSet != nil {
+		nodeSet.SetObservedVersion(observation.Version)
+	}
+}
+
+func matchesControlPlaneUpgradeHistory(history []*privatev1.ClusterUpgradeHistoryEntry, attemptID string) bool {
+	for _, entry := range history {
+		if entry.GetAttemptId() == attemptID && entry.GetComponent().GetControlPlane() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesNodeSetUpgradeHistory(history []*privatev1.ClusterUpgradeHistoryEntry, attemptID, nodeSet string) bool {
+	for _, entry := range history {
+		if entry.GetAttemptId() == attemptID && entry.GetComponent().GetNodeSetId() == nodeSet {
+			return true
+		}
+	}
+	return false
 }
 
 // syncClusterOrderVIPEndpoints copies MetalLB VIP addresses from ClusterOrder status

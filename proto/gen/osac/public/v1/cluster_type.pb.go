@@ -1161,7 +1161,7 @@ type ClusterStatus struct {
 	AddOnOperators []*AddOnOperatorStatus `protobuf:"bytes,12,rep,name=add_on_operators,json=addOnOperators,proto3" json:"add_on_operators,omitempty"`
 	// OpenShift version observed on the hosted control plane.
 	ObservedCpVersion string `protobuf:"bytes,13,opt,name=observed_cp_version,json=observedCpVersion,proto3" json:"observed_cp_version,omitempty"`
-	// Component upgrade attempts in acceptance order. The last entry is the current or most recent attempt.
+	// Component upgrade attempts, newest first. Earlier entries retain their place as their state changes.
 	UpgradeHistory []*ClusterUpgradeHistoryEntry `protobuf:"bytes,15,rep,name=upgrade_history,json=upgradeHistory,proto3" json:"upgrade_history,omitempty"`
 	// Records when fulfillment accepted a change to spec.version. This is the authoritative
 	// timestamp of the version transition: metering splits version-dimensioned usage at this
@@ -1487,7 +1487,7 @@ type ClusterStatus_builder struct {
 	AddOnOperators []*AddOnOperatorStatus
 	// OpenShift version observed on the hosted control plane.
 	ObservedCpVersion string
-	// Component upgrade attempts in acceptance order. The last entry is the current or most recent attempt.
+	// Component upgrade attempts, newest first. Earlier entries retain their place as their state changes.
 	UpgradeHistory []*ClusterUpgradeHistoryEntry
 	// Records when fulfillment accepted a change to spec.version. This is the authoritative
 	// timestamp of the version transition: metering splits version-dimensioned usage at this

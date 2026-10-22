@@ -1293,7 +1293,7 @@ type ClusterStatus_builder struct {
 	AddOnOperators []*AddOnOperatorStatus
 	// OpenShift version observed on the hosted control plane.
 	ObservedCpVersion string
-	// Component upgrade attempts in acceptance order. The last entry is the current or most recent attempt.
+	// Component upgrade attempts, newest first. Earlier entries retain their place as their state changes.
 	UpgradeHistory []*ClusterUpgradeHistoryEntry
 	// Records when fulfillment accepted a change to spec.version. This is the authoritative
 	// timestamp of the version transition: metering splits version-dimensioned usage at this
