@@ -797,7 +797,7 @@ var _ = Describe("Private clusters server", func() {
 			object := response.GetObject()
 			Expect(object).ToNot(BeNil())
 			Expect(object.GetId()).ToNot(BeEmpty())
-			Expect(object.GetStatus().GetObservedCpVersion()).To(Equal("4.17.0"))
+			Expect(object.GetStatus().GetObservedVersion()).To(Equal("4.17.0"))
 			Expect(object.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(Equal("4.17.0"))
 			Expect(object.GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.17.0"))
 
@@ -5318,7 +5318,7 @@ var _ = Describe("Private clusters server", func() {
 				Expect(attempt.GetSourceVersion()).To(Equal("4.17.0"))
 				Expect(attempt.GetTargetVersion()).To(Equal("4.18.0"))
 				Expect(attempt.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
-				Expect(attempt.GetAcceptedTime()).To(Equal(attempt.GetLastStateTime()))
+				Expect(attempt.GetAcceptedTime()).To(Equal(attempt.GetStateTransitionTime()))
 				Expect(updated.GetSpec().GetControlPlaneAttemptId()).To(Equal(attempt.GetAttemptId()))
 			})
 
@@ -5366,8 +5366,9 @@ var _ = Describe("Private clusters server", func() {
 				Expect(history).To(HaveLen(2))
 				cpTransition := &privatev1.ClusterUpgradeHistoryEntry{}
 				cpTransition.SetAttemptId(cpID)
+				cpTransition.SetComponent(proto.Clone(history[1].GetComponent()).(*privatev1.ClusterUpgradeComponent))
 				cpTransition.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
-				cpTransition.SetLastStateTime(timestamppb.New(history[1].GetLastStateTime().AsTime().Add(time.Second)))
+				cpTransition.SetStateTransitionTime(timestamppb.New(history[1].GetStateTransitionTime().AsTime().Add(time.Second)))
 				cpTransition.SetMessage("Control plane is updating")
 				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 					Object: privatev1.Cluster_builder{Id: cluster.GetId(),
@@ -5382,6 +5383,79 @@ var _ = Describe("Private clusters server", func() {
 				Expect(merged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
 				Expect(proto.Equal(merged[1].GetComponent(), history[1].GetComponent())).To(BeTrue())
 				Expect(proto.Equal(merged[1].GetAcceptedTime(), history[1].GetAcceptedTime())).To(BeTrue())
+			})
+
+			It("merges each component independently when attempt IDs are shared", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				updateVersion(cluster.GetId(), "4-18-0")
+				withNodeSet := updateNodeSetVersion(cluster.GetId(), "compute")
+				stored := withNodeSet.GetStatus().GetUpgradeHistory()
+				Expect(stored).To(HaveLen(2))
+				Expect(stored[0].GetComponent().GetNodeSetId()).To(Equal("compute"))
+				Expect(stored[1].GetComponent().GetControlPlane()).NotTo(BeNil())
+				stored[1].SetAttemptId(stored[0].GetAttemptId())
+
+				nodeSetUpdate := proto.Clone(stored[0]).(*privatev1.ClusterUpgradeHistoryEntry)
+				nodeSetUpdate.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
+				nodeSetUpdate.SetMessage("Node pool is updating")
+				nodeSetUpdate.SetStateTransitionTime(timestamppb.New(stored[0].GetStateTransitionTime().AsTime().Add(time.Second)))
+				controlPlaneUpdate := proto.Clone(stored[1]).(*privatev1.ClusterUpgradeHistoryEntry)
+				controlPlaneUpdate.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED)
+				controlPlaneUpdate.SetMessage("Control plane upgrade failed")
+				controlPlaneUpdate.SetStateTransitionTime(timestamppb.New(stored[1].GetStateTransitionTime().AsTime().Add(time.Second)))
+
+				merged := mergeClusterUpgradeStateChanges(stored,
+					[]*privatev1.ClusterUpgradeHistoryEntry{nodeSetUpdate, controlPlaneUpdate})
+				Expect(merged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
+				Expect(merged[0].GetMessage()).To(Equal("Node pool is updating"))
+				Expect(merged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED))
+				Expect(merged[1].GetMessage()).To(Equal("Control plane upgrade failed"))
+
+				controlPlaneOnly := mergeClusterUpgradeStateChanges(stored,
+					[]*privatev1.ClusterUpgradeHistoryEntry{controlPlaneUpdate})
+				Expect(controlPlaneOnly[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(controlPlaneOnly[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED))
+
+				missingComponent := proto.Clone(controlPlaneUpdate).(*privatev1.ClusterUpgradeHistoryEntry)
+				missingComponent.SetComponent(nil)
+				unchanged := mergeClusterUpgradeStateChanges(stored,
+					[]*privatev1.ClusterUpgradeHistoryEntry{missingComponent})
+				Expect(unchanged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(unchanged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				unchanged = mergeClusterUpgradeStateChanges(stored[1:],
+					[]*privatev1.ClusterUpgradeHistoryEntry{missingComponent})
+				Expect(unchanged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+			})
+
+			It("freezes the node count at acceptance", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				updated := updateNodeSetVersion(cluster.GetId(), "compute")
+				entry := updated.GetStatus().GetUpgradeHistory()[0]
+				acceptedCount := max(int32(1), updated.GetSpec().GetNodeSets()["compute"].GetSize())
+				Expect(entry.GetTimeoutNodeCount()).To(Equal(acceptedCount))
+				transition := &privatev1.ClusterUpgradeHistoryEntry{}
+				transition.SetAttemptId(entry.GetAttemptId())
+				transition.SetComponent(proto.Clone(entry.GetComponent()).(*privatev1.ClusterUpgradeComponent))
+				transition.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
+				transition.SetStateTransitionTime(timestamppb.New(entry.GetStateTransitionTime().AsTime().Add(time.Second)))
+				transition.SetTimeoutNodeCount(acceptedCount + 2)
+				update := func() *privatev1.ClusterUpgradeHistoryEntry {
+					response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object: privatev1.Cluster_builder{Id: cluster.GetId(),
+							Status: privatev1.ClusterStatus_builder{UpgradeHistory: []*privatev1.ClusterUpgradeHistoryEntry{transition}}.Build()}.Build(),
+						UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.upgrade_history"}},
+					}.Build())
+					Expect(err).NotTo(HaveOccurred())
+					return response.GetObject().GetStatus().GetUpgradeHistory()[0]
+				}
+				progressing := update()
+				Expect(progressing.GetTimeoutNodeCount()).To(Equal(acceptedCount))
+				transition.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_TIMED_OUT)
+				transition.SetStateTransitionTime(timestamppb.New(progressing.GetStateTransitionTime().AsTime().Add(time.Second)))
+				transition.SetTimeoutNodeCount(acceptedCount + 4)
+				Expect(update().GetTimeoutNodeCount()).To(Equal(acceptedCount))
 			})
 
 			It("preserves server-owned attempt IDs on full-object and parent-spec edits", func() {

@@ -413,6 +413,12 @@ Touched-area requirements: [component guide](../osac-operator/AGENTS.md#integrat
 ### Coverage notes
 
 - **Pure helpers, validation, or state calculations:** Include errors and edge cases.
+- **ClusterOrder upgrade observation and deadlines ([DEV] OSAC-6265):**
+  `test/integration/clusterorder_upgrade_contract_test.go` writes valid and
+  invalid control-plane and node-set observation states through the installed
+  ClusterOrder status subresource, and reads the three timeout variables from
+  the deployed operator. It requires the current CRD and operator deployment;
+  it does not exercise Fulfillment or PostgreSQL feedback.
 - **Fulfillment client TLS:** `cmd/verified_fulfillment_test.go` probes local TLS
   valid/invalid CA and hostname cases, bundle rotation and last-client retention.
   The production render contract covers mounts/arguments; Kind runs with the
