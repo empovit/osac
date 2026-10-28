@@ -27,6 +27,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -5297,6 +5298,47 @@ var _ = Describe("Private clusters server", func() {
 				Expect(err).NotTo(HaveOccurred())
 				return response.GetObject()
 			}
+			historyEntries := func(count int) []*privatev1.ClusterUpgradeHistoryEntry {
+				states := []privatev1.ClusterUpgradeState{
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_TIMED_OUT,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_NODE_SET_REMOVED,
+				}
+				entries := make([]*privatev1.ClusterUpgradeHistoryEntry, count)
+				for i := range entries {
+					component := &privatev1.ClusterUpgradeComponent{}
+					if i%2 == 0 {
+						component.SetControlPlane(&emptypb.Empty{})
+					} else {
+						component.SetNodeSetId("compute")
+					}
+					entry := &privatev1.ClusterUpgradeHistoryEntry{}
+					entry.SetAttemptId(fmt.Sprintf("history-%03d", i))
+					entry.SetComponent(component)
+					entry.SetSourceVersion("4.17.0")
+					entry.SetTargetVersion("4.18.0")
+					timestamp := timestamppb.New(time.Unix(int64(1000-i), 0))
+					entry.SetAcceptedTime(timestamp)
+					entry.SetStateTransitionTime(timestamp)
+					entry.SetState(states[i%len(states)])
+					entries[i] = entry
+				}
+				return entries
+			}
+			seedHistory := func(cluster *privatev1.Cluster, history []*privatev1.ClusterUpgradeHistoryEntry) {
+				clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				stored := proto.Clone(cluster).(*privatev1.Cluster)
+				stored.GetStatus().SetUpgradeHistory(history)
+				_, err = clustersDao.Update().SetObject(stored).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+			}
 
 			It("Is unset until the version changes", func() {
 				object := createCluster()
@@ -5335,6 +5377,48 @@ var _ = Describe("Private clusters server", func() {
 				Expect(again.GetStatus().GetVersionTransitionTime().AsTime()).To(Equal(stamp.AsTime()))
 				Expect(again.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
 				Expect(again.GetSpec().GetControlPlaneAttemptId()).To(Equal(updated.GetSpec().GetControlPlaneAttemptId()))
+			})
+
+			It("retains the newest 100 entries across components and states when accepting an upgrade", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				seedHistory(cluster, historyEntries(100))
+
+				updated := updateVersion(cluster.GetId(), "4-18-0")
+				history := updated.GetStatus().GetUpgradeHistory()
+
+				Expect(history).To(HaveLen(100))
+				Expect(history[0].GetAttemptId()).To(Equal(updated.GetSpec().GetControlPlaneAttemptId()))
+				Expect(history[1].GetAttemptId()).To(Equal("history-000"))
+				Expect(history[1].GetComponent().GetControlPlane()).NotTo(BeNil())
+				Expect(history[2].GetAttemptId()).To(Equal("history-001"))
+				Expect(history[2].GetComponent().GetNodeSetId()).To(Equal("compute"))
+				Expect(history[3].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_TIMED_OUT))
+				Expect(history[99].GetAttemptId()).To(Equal("history-098"))
+			})
+
+			It("trims an oversized history when accepting a node-set upgrade without changing cluster state", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				cluster.GetSpec().SetControlPlaneAttemptId("existing-control-plane-attempt")
+				cluster.GetSpec().SetNodeSetAttemptIds(map[string]string{"compute": "existing-compute-attempt"})
+				cluster.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_READY)
+				cluster.GetStatus().SetObservedVersion("4.17.0")
+				cluster.GetStatus().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
+					"compute": privatev1.ClusterNodeSet_builder{ObservedVersion: "4.17.0"}.Build(),
+				})
+				seedHistory(cluster, historyEntries(102))
+
+				updated := updateNodeSetVersion(cluster.GetId(), "compute")
+				history := updated.GetStatus().GetUpgradeHistory()
+
+				Expect(history).To(HaveLen(100))
+				Expect(history[0].GetAttemptId()).To(Equal(updated.GetSpec().GetNodeSetAttemptIds()["compute"]))
+				Expect(history[99].GetAttemptId()).To(Equal("history-098"))
+				Expect(updated.GetSpec().GetControlPlaneAttemptId()).To(Equal("existing-control-plane-attempt"))
+				Expect(updated.GetStatus().GetObservedVersion()).To(Equal("4.17.0"))
+				Expect(updated.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+				Expect(updated.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(Equal("4.17.0"))
 			})
 
 			It("keeps independent component IDs and newest-first history", func() {

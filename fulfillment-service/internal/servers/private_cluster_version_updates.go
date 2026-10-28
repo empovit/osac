@@ -57,6 +57,17 @@ type clusterVersionChange struct {
 	nodeCount     int32
 }
 
+const maxClusterUpgradeHistoryEntries = 100
+
+func retainRecentClusterUpgradeHistory(
+	entries []*privatev1.ClusterUpgradeHistoryEntry,
+) []*privatev1.ClusterUpgradeHistoryEntry {
+	if len(entries) <= maxClusterUpgradeHistoryEntries {
+		return entries
+	}
+	return entries[:maxClusterUpgradeHistoryEntries]
+}
+
 // findClusterVersionChange returns the first version change
 // represented by the update.
 func findClusterVersionChange(current, candidate *privatev1.Cluster, controlPlaneChanged bool) *clusterVersionChange {
@@ -108,8 +119,9 @@ func appendClusterUpgradeAttempt(candidate *privatev1.Cluster, change *clusterVe
 	entry.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING)
 	entry.SetAttemptId(uuid.New())
 	entry.SetTimeoutNodeCount(change.nodeCount)
-	candidate.GetStatus().SetUpgradeHistory(append(
-		[]*privatev1.ClusterUpgradeHistoryEntry{entry}, candidate.GetStatus().GetUpgradeHistory()...))
+	history := append(
+		[]*privatev1.ClusterUpgradeHistoryEntry{entry}, candidate.GetStatus().GetUpgradeHistory()...)
+	candidate.GetStatus().SetUpgradeHistory(retainRecentClusterUpgradeHistory(history))
 	if change.component.GetControlPlane() != nil {
 		candidate.GetSpec().SetControlPlaneAttemptId(entry.GetAttemptId())
 	} else {
