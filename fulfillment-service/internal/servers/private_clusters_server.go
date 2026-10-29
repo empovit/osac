@@ -432,6 +432,8 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 	return
 }
 
+// validateClusterUpdateRequest validates an update request and returns the
+// ClusterVersion resolved during version validation.
 func (s *PrivateClustersServer) validateClusterUpdateRequest(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) (*privatev1.ClusterVersion, error) {
 	resolvedTarget, err := s.validateVersionUpdate(ctx, request)
@@ -450,6 +452,8 @@ func (s *PrivateClustersServer) validateClusterUpdateRequest(ctx context.Context
 	return resolvedTarget, nil
 }
 
+// prepareUpdatedCluster applies server-owned defaults and validation to the
+// completed update candidate before it is persisted.
 func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, current, candidate *privatev1.Cluster,
 	request *privatev1.ClustersUpdateRequest, resolvedTarget *privatev1.ClusterVersion) error {
 	// An unmasked metadata-only request omits spec. Keep the stored spec so its
@@ -495,6 +499,8 @@ func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, curre
 	return s.prepareUpdatedClusterReferences(ctx, current, candidate, mask, sizeOnlyNodeSets)
 }
 
+// initializeAddedNodeSetVersions seeds observed versions for node sets added
+// by an update.
 func (s *PrivateClustersServer) initializeAddedNodeSetVersions(ctx context.Context,
 	current, candidate *privatev1.Cluster) error {
 	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
