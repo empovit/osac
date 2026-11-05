@@ -231,7 +231,7 @@ func syncClusterOrderUpgradeObservationsAt(order *ckv1alpha1.ClusterOrder, remot
 // observation into its matching history entry.
 func syncControlPlaneUpgradeObservationAt(observation *ckv1alpha1.UpgradeObservation, remote *privatev1.Cluster, now time.Time) {
 	if observation == nil || observation.AttemptID == "" ||
-		observation.AttemptID != remote.GetSpec().GetControlPlaneAttemptId() {
+		observation.AttemptID != remote.GetSpec().GetUpgradeAttemptId() {
 		return
 	}
 	for _, entry := range remote.GetStatus().GetUpgradeHistory() {
@@ -262,9 +262,10 @@ func syncNodeSetUpgradeObservationAt(request ckv1alpha1.NodeRequestStatus, remot
 // nodeSetObservationMatchesCurrentAttempt also permits feedback for a removed
 // node set while its old NodePool and history entry still exist.
 func nodeSetObservationMatchesCurrentAttempt(request ckv1alpha1.NodeRequestStatus, remote *privatev1.Cluster) bool {
-	currentID := remote.GetSpec().GetNodeSetAttemptIds()[request.NodeSet]
-	return currentID == request.UpgradeObservation.AttemptID ||
-		(currentID == "" && remote.GetSpec().GetNodeSets()[request.NodeSet] == nil)
+	if remote.GetSpec().GetUpgradeAttemptId() == request.UpgradeObservation.AttemptID {
+		return true
+	}
+	return remote.GetSpec().GetNodeSets()[request.NodeSet] == nil
 }
 
 // syncUpgradeEntry advances history from component feedback. A timed-out entry
@@ -315,8 +316,8 @@ func observationShowsProgress(observation *ckv1alpha1.UpgradeObservation,
 	return true
 }
 
-// applyUpgradeTimeouts marks overdue current attempts as timed
-// out while observation continues.
+// applyUpgradeTimeouts marks overdue components of the current attempt as
+// timed out while observation continues.
 func applyUpgradeTimeouts(remote *privatev1.Cluster, now time.Time, config ClusterUpgradeTimeouts) {
 	for _, entry := range remote.GetStatus().GetUpgradeHistory() {
 		if entry.GetAcceptedTime() == nil || !isPendingOrProgressingUpgrade(entry) || !isCurrentUpgradeAttempt(remote, entry) {
@@ -337,15 +338,15 @@ func isPendingOrProgressingUpgrade(entry *privatev1.ClusterUpgradeHistoryEntry) 
 		entry.GetState() == privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING
 }
 
-// isCurrentUpgradeAttempt reports whether the history entry
-// belongs to the cluster current component attempt.
+// isCurrentUpgradeAttempt reports whether the history entry belongs to the
+// cluster's current whole-cluster attempt.
 func isCurrentUpgradeAttempt(remote *privatev1.Cluster, entry *privatev1.ClusterUpgradeHistoryEntry) bool {
 	if nodeSet := entry.GetComponent().GetNodeSetId(); nodeSet != "" {
 		return remote.GetSpec().GetNodeSets()[nodeSet] != nil &&
-			remote.GetSpec().GetNodeSetAttemptIds()[nodeSet] == entry.GetAttemptId()
+			remote.GetSpec().GetUpgradeAttemptId() == entry.GetAttemptId()
 	}
 	return entry.GetComponent().GetControlPlane() != nil &&
-		remote.GetSpec().GetControlPlaneAttemptId() == entry.GetAttemptId()
+		remote.GetSpec().GetUpgradeAttemptId() == entry.GetAttemptId()
 }
 
 // upgradeTimeoutDetails chooses the acceptance or progress clock and the
@@ -1004,12 +1005,12 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 
 		nodeSets := remote.GetStatus().GetNodeSets()
 		if nodeSets == nil {
-			nodeSets = map[string]*privatev1.ClusterNodeSet{}
+			nodeSets = map[string]*privatev1.ClusterNodeSetStatus{}
 			remote.GetStatus().SetNodeSets(nodeSets)
 		}
 		nodeSet := nodeSets[nodeSetID]
 		if nodeSet == nil {
-			nodeSet = privatev1.ClusterNodeSet_builder{}.Build()
+			nodeSet = privatev1.ClusterNodeSetStatus_builder{}.Build()
 			nodeSets[nodeSetID] = nodeSet
 		}
 		nodeSet.SetBaremetalInstanceType(proto.Clone(instanceType).(*privatev1.BareMetalInstanceTypeReference))

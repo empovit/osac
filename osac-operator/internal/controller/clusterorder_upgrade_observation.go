@@ -14,8 +14,6 @@ language governing permissions and limitations under the License.
 package controller
 
 import (
-	"encoding/json"
-
 	configv1 "github.com/openshift/api/config/v1"
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,11 +35,8 @@ func recordUpgradeObservations(order *v1alpha1.ClusterOrder,
 		request.UpgradeObservation = nil
 		requestsByNodeSet[request.NodeSet] = request
 	}
-	var ids v1alpha1.ClusterOrderUpgradeAttemptIDs
-	if encoded := order.Annotations[v1alpha1.UpgradeAttemptIDsAnnotation]; encoded != "" {
-		_ = json.Unmarshal([]byte(encoded), &ids)
-	}
-	order.Status.UpgradeObservation = controlPlaneUpgradeObservation(order, hc, ids.ControlPlane)
+	id := order.Annotations[v1alpha1.UpgradeAttemptIDAnnotation]
+	order.Status.UpgradeObservation = controlPlaneUpgradeObservation(order, hc, id)
 	for i := range pools {
 		pool := &pools[i]
 		nodeSet, ok := nodePoolNodeSet(pool)
@@ -50,7 +45,7 @@ func recordUpgradeObservations(order *v1alpha1.ClusterOrder,
 		}
 		if request := requestsByNodeSet[nodeSet]; request != nil {
 			request.UpgradeObservation = nodePoolUpgradeObservationForAttempt(
-				order, pool, nodeSet, ids.NodeSets[nodeSet], previous[nodeSet])
+				order, pool, nodeSet, id, previous[nodeSet])
 		}
 	}
 }
@@ -273,16 +268,13 @@ func nodeSetRequested(order *v1alpha1.ClusterOrder, nodeSet string) bool {
 	return false
 }
 
-// nodePoolReleaseMatchesOrder reports whether a NodePool uses its requested
-// release image, falling back to the order-wide image when necessary.
+// nodePoolReleaseMatchesOrder reports whether a NodePool uses the explicit
+// release image requested for that node set. A missing node image never matches
+// because the AAP provider also requires an explicit per-node-set image.
 func nodePoolReleaseMatchesOrder(order *v1alpha1.ClusterOrder, nodeSet, image string) bool {
 	for _, request := range order.Spec.NodeRequests {
 		if request.NodeSet == nodeSet {
-			desired := request.ReleaseImage
-			if desired == "" {
-				desired = order.Spec.ReleaseImage
-			}
-			return image == desired
+			return request.ReleaseImage != "" && image == request.ReleaseImage
 		}
 	}
 	return false

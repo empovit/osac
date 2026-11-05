@@ -638,12 +638,14 @@ Touched-area requirements: [component guide](../osac-operator/AGENTS.md#integrat
 ### Coverage notes
 
 - **Pure helpers, validation, or state calculations:** Include errors and edge cases.
-- **ClusterOrder upgrade observation and deadlines ([DEV] OSAC-6265):**
-  `test/integration/clusterorder_upgrade_contract_test.go` writes valid and
-  invalid control-plane and node-set observation states through the installed
-  ClusterOrder status subresource, and reads the three timeout variables from
-  the deployed operator. It requires the current CRD and operator deployment;
-  it does not exercise Fulfillment or PostgreSQL feedback.
+- **ClusterOrder upgrade dispatch, observation, and deadlines
+  ([DEV] OSAC-6265, OSAC-7232):** the Controller Suite in `make test` covers
+  the ClusterOrder dispatch and feedback boundary with the real Kubernetes
+  API, etcd, and CRDs while AAP and HyperShift inputs are controlled. The
+  installed CRD/status and manager timeout-variable boundary is covered by
+  `test/integration/clusterorder_upgrade_contract_test.go` through
+  `make integration-tests`. Fulfillment persistence and the AAP workflow are
+  not exercised; see their component sections.
 - **Fulfillment client TLS:** `cmd/verified_fulfillment_test.go` probes local TLS
   valid/invalid CA and hostname cases, bundle rotation and last-client retention.
   `cmd/installation_setting_test.go` checks the pre-manager startup call through
@@ -888,7 +890,7 @@ Touched-area requirements: [component guide](../osac-aap/AGENTS.md#integration-t
 | Unit | `tests/unit/plugins/lookup/test_fulfillment_token.py`; included by `uv run pytest tests/unit` | OIDC discovery validation, Keycloak client-credentials exchange, token caching/refresh, and sanitized failures | Keycloak and Fulfillment are mocked; this does not prove deployed credentials or cross-cluster reachability. |
 | Unit | `tests/unit/test_publish_templates_auth_config.py`; included by `uv run pytest tests/unit` | Parsed publisher pod spec, Kubernetes service-account projection, and OAuth Secret/ConfigMap references | No Kubernetes objects are created and no AAP API or external issuer is contacted. |
 | Unit / isolated role transform ([DEV]) | `uv run --group development ansible-playbook collections/ansible_collections/osac/service/roles/hosted_cluster/tests/test.yml` | Executable NodePool definition transforms: distinct NodeSet names and selectors for the same hardware profile, independent replica counts and scale-up | No Kubernetes resources are created. This is not component-integration or deployed AAP/provider coverage; those gaps remain owned by [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). |
-| Component integration | `tests/integration/`; `make test` (creates Kind, runs playbooks, and tears it down) | Ansible roles/playbooks against real Kind APIs, including a second isolated API for storage target routing, plus CRDs, leases, finalizers, and test-runner pod | AAP, OpenStack, KubeVirt/RHACM, and other provider APIs are not generally real; the VMS storage target uses a mock server. |
+| Component integration | `tests/integration/`; `make test` (creates Kind, runs playbooks, and tears it down) | Ansible roles/playbooks against real Kind APIs, including a second isolated API for storage target routing, plus CRDs, leases, finalizers, and test-runner pod. `cluster_upgrade_workflow` runs the existing cluster workflow through its same-type Lease and applies the control-plane and NodePool image batch, shared attempt annotations, later explicit-image preservation, and a controlled rejection of malformed NodePool modification-hook output. | AAP, OpenStack, KubeVirt/RHACM, and other provider APIs are not generally real; the VMS storage target uses a mock server. `cluster_upgrade_workflow` uses minimal HyperShift CRDs, invokes the existing workflow directly as the AAP payload, and removes its Lease between completed runs to model job cleanup; no deployed AAP, HyperShift controller, operator config-hash loop, or provider/data-plane upgrade runs. |
 | Unit / isolated role transform (OSAC-6182) | `collections/ansible_collections/osac/templates/roles/ocp_virt_vm/tests/test.yml`; Tests 15–17 run in separate Ansible processes via `make test` and its existing CI job, selected by `test_windows_userdata_sysprep`, `test_windows_no_userdata`, and `test_linux_userdata_cloudinit` | Windows user-data extraction and pre-secrets base spec, no-user-data Windows routing, and Linux cloud-init/virtio routing without sysprep | No Kubernetes Secret operations or Windows guest boot. Linux cloud-init wiring is an offline patch replay; the Kind scenario below owns real sysprep Secret copying and wiring. |
 | Unit + Component integration ([DEV] OSAC-6596) | `collections/ansible_collections/osac/service/roles/tenant_storage_class/tests/test.yml` and `tests/integration/targets/compute_instance_create/tasks/csp_storage_tiers.yml` in `make test` | Ansible tier resolution, deduplication, fail-closed pre-finalizer rejection (including whitespace-only StorageClass names), and Kind `DataVolume.spec.pvc.storageClassName` creation | No deployed AAP server or live KubeVirt VM boot ([OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843)). |
 | Component integration ([DEV] OSAC-6182) | `tests/integration/targets/compute_instance_create/tasks/sysprep_secret_copy.yml`; included by `make test` | Compute-instance create workflow and real `create_secrets.yaml` tasks against Kind: rejects missing tenant annotations, copies `userdata` unchanged to `Unattend.xml`, and verifies tenant annotation, VM label, and SATA CD-ROM/Secret references in the resulting in-memory VM spec | VM/DataVolume creation and readiness are overridden; no Windows guest boot, deployed AAP/operator, or real-provider lifecycle is exercised. Offline role Test 15 covers only extraction and the pre-secrets base spec. |

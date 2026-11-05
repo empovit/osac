@@ -19,7 +19,6 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -304,9 +303,7 @@ func (t *task) update(ctx context.Context) error {
 		orderAnnotations := map[string]string{
 			annotations.Tenant: t.cluster.GetMetadata().GetTenant(),
 		}
-		if err := setUpgradeAttemptAnnotations(orderAnnotations, t.cluster.GetSpec()); err != nil {
-			return err
-		}
+		setUpgradeAttemptAnnotations(orderAnnotations, t.cluster.GetSpec())
 		object := &osacv1alpha1.ClusterOrder{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:    t.hubNamespace,
@@ -339,9 +336,7 @@ func (t *task) update(ctx context.Context) error {
 		if update.Annotations == nil {
 			update.Annotations = map[string]string{}
 		}
-		if err := setUpgradeAttemptAnnotations(update.Annotations, t.cluster.GetSpec()); err != nil {
-			return err
-		}
+		setUpgradeAttemptAnnotations(update.Annotations, t.cluster.GetSpec())
 		err = t.hubClient.Patch(ctx, update, clnt.MergeFrom(object))
 		if err != nil {
 			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
@@ -366,20 +361,11 @@ func (t *task) update(ctx context.Context) error {
 	return err
 }
 
-func setUpgradeAttemptAnnotations(values map[string]string, spec *privatev1.ClusterSpec) error {
-	delete(values, osacv1alpha1.UpgradeAttemptIDsAnnotation)
-	ids := osacv1alpha1.ClusterOrderUpgradeAttemptIDs{
-		ControlPlane: spec.GetControlPlaneAttemptId(),
-		NodeSets:     spec.GetNodeSetAttemptIds(),
+func setUpgradeAttemptAnnotations(values map[string]string, spec *privatev1.ClusterSpec) {
+	delete(values, osacv1alpha1.UpgradeAttemptIDAnnotation)
+	if id := spec.GetUpgradeAttemptId(); id != "" {
+		values[osacv1alpha1.UpgradeAttemptIDAnnotation] = id
 	}
-	if ids.ControlPlane != "" || len(ids.NodeSets) > 0 {
-		encoded, err := json.Marshal(ids)
-		if err != nil {
-			return err
-		}
-		values[osacv1alpha1.UpgradeAttemptIDsAnnotation] = string(encoded)
-	}
-	return nil
 }
 
 func (t *task) setDefaults() {
@@ -459,18 +445,34 @@ func (t *task) addNodeReleaseImages(ctx context.Context, spec *osacv1alpha1.Clus
 	}
 	for i := range spec.NodeRequests {
 		request := &spec.NodeRequests[i]
-		versionName := t.cluster.GetSpec().GetNodeSets()[request.NodeSet].GetVersion().GetName()
-		if versionName == "" {
+		version := t.cluster.GetStatus().GetNodeSets()[request.NodeSet].GetVersion()
+		if version == nil {
 			continue
 		}
-		image, ok := versionImages[versionName]
+
+		// Legacy status references and migration 149 can contain only the
+		// canonical version ID. Resolve those directly instead of silently
+		// omitting the NodeRequest release image.
+		versionKey := version.GetName()
+		if versionKey == "" {
+			if version.GetId() == "" {
+				continue
+			}
+			versionKey = "id:" + version.GetId()
+		}
+
+		image, ok := versionImages[versionKey]
 		if !ok {
 			var err error
-			image, err = t.resolveVersionImage(ctx, versionName)
+			if version.GetName() != "" {
+				image, err = t.resolveVersionImage(ctx, version.GetName())
+			} else {
+				image, err = t.resolveVersionImageByID(ctx, version.GetId())
+			}
 			if err != nil {
 				return fmt.Errorf("failed to resolve node set %q version: %w", request.NodeSet, err)
 			}
-			versionImages[versionName] = image
+			versionImages[versionKey] = image
 		}
 		request.ReleaseImage = image
 	}
@@ -567,6 +569,24 @@ func (t *task) resolvePullSecret(ctx context.Context, ref *privatev1.SecretLocal
 		)
 	}
 	return string(raw), nil
+}
+
+// resolveVersionImageByID looks up a ClusterVersion by its canonical ID and
+// returns its release image.
+func (t *task) resolveVersionImageByID(ctx context.Context, versionID string) (string, error) {
+	response, err := t.r.clusterVersionsClient.Get(ctx, privatev1.ClusterVersionsGetRequest_builder{
+		Id: versionID,
+	}.Build())
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return "", fmt.Errorf("%w: '%s'", errClusterVersionNotFound, versionID)
+		}
+		return "", fmt.Errorf("failed to get cluster version '%s': %w", versionID, err)
+	}
+	if response.GetObject() == nil {
+		return "", fmt.Errorf("%w: '%s'", errClusterVersionNotFound, versionID)
+	}
+	return response.GetObject().GetSpec().GetImage(), nil
 }
 
 // resolveVersionImage looks up a ClusterVersion by name and returns its release image.
