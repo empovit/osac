@@ -212,11 +212,8 @@ message ClusterSpec {
     (buf.validate.field).repeated.max_items = 32
   ];
 
-  // Current server-owned upgrade attempt for the control plane.
-  string control_plane_attempt_id = 13 [(cleanapi.field).private = true];
-
-  // Current server-owned upgrade attempt for each named node set.
-  map<string, string> node_set_attempt_ids = 14 [(cleanapi.field).private = true];
+  // Current server-owned upgrade attempt for the whole cluster.
+  string upgrade_attempt_id = 13 [(cleanapi.field).private = true];
 }
 
 // The per-operator status contains the installation state of one add-on operator.
@@ -346,7 +343,7 @@ message ClusterStatus {
   reserved 14;
   reserved "upgrade";
 
-  // Component upgrade attempts, newest first. Earlier entries retain their place as their state changes.
+  // Per-component upgrade history, newest first. Earlier entries retain their place as their state changes.
   repeated ClusterUpgradeHistoryEntry upgrade_history = 15 [(google.api.field_behavior) = OUTPUT_ONLY];
 
   // Records when fulfillment accepted a change to spec.version. This is the authoritative
@@ -358,7 +355,7 @@ message ClusterStatus {
   optional google.protobuf.Timestamp version_transition_time = 16 [(google.api.field_behavior) = OUTPUT_ONLY];
 }
 
-// State of a component upgrade attempt, independent of the cluster's readiness state.
+// State of one component in a cluster upgrade attempt, independent of the cluster's readiness state.
 enum ClusterUpgradeState {
   // No upgrade state has been reported. Accepted attempts start in PENDING.
   CLUSTER_UPGRADE_STATE_UNSPECIFIED = 0;
@@ -379,8 +376,8 @@ enum ClusterUpgradeState {
   // HyperShift reported a terminal error and stopped working toward the requested version.
   CLUSTER_UPGRADE_STATE_FAILED = 5;
 
-  // The node set was removed and its NodePool deleted while this attempt was Pending or Progressing.
-  // An attempt already marked TimedOut retains that outcome after removal.
+  // The node set was removed and its NodePool deleted while this component was Pending or Progressing.
+  // A component already marked TimedOut retains that outcome after removal.
   CLUSTER_UPGRADE_STATE_NODE_SET_REMOVED = 6;
 }
 
@@ -397,33 +394,33 @@ message ClusterUpgradeComponent {
   }
 }
 
-// State and progress of one component upgrade attempt.
+// State and progress of one component in a cluster upgrade attempt.
 message ClusterUpgradeHistoryEntry {
-  // Control plane or node set selected for this attempt.
+  // Control plane or node set selected for this component.
   ClusterUpgradeComponent component = 1 [(buf.validate.field).required = true];
 
-  // OpenShift version observed on the selected component when the attempt was accepted, as a semver string.
+  // OpenShift version observed on the selected component when it was accepted into the shared cluster attempt, as a semver string.
   string source_version = 2;
 
   // OpenShift version requested for the selected component, as a semver string.
   string target_version = 3;
 
-  // Time OSAC accepted the attempt.
+  // Time OSAC accepted this component into the shared cluster attempt.
   google.protobuf.Timestamp accepted_time = 4;
 
-  // Time this attempt entered its current state, including a later update after TIMED_OUT.
+  // Time this component entered its current state, including a later update after TIMED_OUT.
   google.protobuf.Timestamp state_transition_time = 5;
 
-  // Current outcome or progress state of this attempt.
+  // Current outcome or progress state of this component.
   ClusterUpgradeState state = 6;
 
   // Human-readable explanation of the state, including any failure or timeout reason.
   string message = 7;
 
-  // Identifier correlating this history entry with private operator feedback.
+  // Shared identifier correlating every component in one cluster attempt with private operator feedback.
   string attempt_id = 8 [(cleanapi.field).private = true];
 
-  // Number of selected nodes when the node-set attempt was accepted.
+  // Number of selected nodes when the node-set component was accepted.
   // Private feedback uses this frozen count for the per-node timeout.
   int32 timeout_node_count = 9 [(cleanapi.field).private = true];
 }
@@ -533,7 +530,7 @@ message ClusterNodeSet {
   BareMetalInstanceTypeReference baremetal_instance_type = 4 [(google.api.field_behavior) = IMMUTABLE];
 
   // Desired OpenShift version of this node set.
-  ClusterVersionReference version = 5;
+  ClusterVersionReference version = 5 [(cleanapi.field).private = true];
 
   // OpenShift version observed on this node set. Populated only in Cluster status.
   string observed_version = 6 [(google.api.field_behavior) = OUTPUT_ONLY];

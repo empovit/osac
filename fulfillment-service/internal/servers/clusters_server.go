@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
@@ -297,8 +296,7 @@ func (s *ClustersServer) Update(ctx context.Context,
 			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is output-only", path)
 			return
 		}
-		if path == "spec.control_plane_attempt_id" || path == "spec.node_set_attempt_ids" ||
-			strings.HasPrefix(path, "spec.node_set_attempt_ids.") {
+		if path == "spec.upgrade_attempt_id" {
 			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is server-owned", path)
 			return
 		}

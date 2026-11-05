@@ -123,10 +123,12 @@ var _ = Describe("Generic mapper", func() {
 						"my-node-set": privatev1.ClusterNodeSet_builder{
 							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "my_bmit"}.Build(),
 							Size:                  proto.Int32(123),
+							Version:               privatev1.ClusterVersionReference_builder{Id: "my_version"}.Build(),
 						}.Build(),
 						"your-node-set": privatev1.ClusterNodeSet_builder{
 							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "your_bmit"}.Build(),
 							Size:                  proto.Int32(456),
+							Version:               privatev1.ClusterVersionReference_builder{Id: "your_version"}.Build(),
 						}.Build(),
 					},
 				}.Build(),

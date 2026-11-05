@@ -14,8 +14,6 @@ language governing permissions and limitations under the License.
 package controller
 
 import (
-	"encoding/json"
-
 	configv1 "github.com/openshift/api/config/v1"
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,11 +35,8 @@ func recordUpgradeObservations(order *v1alpha1.ClusterOrder,
 		request.UpgradeObservation = nil
 		requestsByNodeSet[request.NodeSet] = request
 	}
-	var ids v1alpha1.ClusterOrderUpgradeAttemptIDs
-	if encoded := order.Annotations[v1alpha1.UpgradeAttemptIDsAnnotation]; encoded != "" {
-		_ = json.Unmarshal([]byte(encoded), &ids)
-	}
-	order.Status.UpgradeObservation = controlPlaneUpgradeObservation(order, hc, ids.ControlPlane)
+	id := order.Annotations[v1alpha1.UpgradeAttemptIDAnnotation]
+	order.Status.UpgradeObservation = controlPlaneUpgradeObservation(order, hc, id)
 	for i := range pools {
 		pool := &pools[i]
 		nodeSet, ok := nodePoolNodeSet(pool)
@@ -50,7 +45,7 @@ func recordUpgradeObservations(order *v1alpha1.ClusterOrder,
 		}
 		if request := requestsByNodeSet[nodeSet]; request != nil {
 			request.UpgradeObservation = nodePoolUpgradeObservationForAttempt(
-				order, pool, nodeSet, ids.NodeSets[nodeSet], previous[nodeSet])
+				order, pool, nodeSet, id, previous[nodeSet])
 		}
 	}
 }

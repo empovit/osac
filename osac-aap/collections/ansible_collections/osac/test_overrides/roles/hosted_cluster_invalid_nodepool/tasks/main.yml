@@ -1,0 +1,19 @@
+---
+- name: Initialize the modified NodePool definitions
+  ansible.builtin.set_fact:
+    hosted_cluster_invalid_nodepool_definitions: []
+
+- name: Invalidate only the batch NodePool definition
+  ansible.builtin.set_fact:
+    hosted_cluster_invalid_nodepool_definitions: >-
+      {{ hosted_cluster_invalid_nodepool_definitions
+         + [item | combine({'metadata': {'name': ''}}, recursive=true)]
+         if item.metadata.labels[agent_node_set_label] == 'batch'
+         else hosted_cluster_invalid_nodepool_definitions + [item] }}
+  loop: "{{ nodepool_definitions }}"
+  loop_control:
+    label: "{{ item.metadata.labels[agent_node_set_label] }}"
+
+- name: Replace the NodePool definitions
+  ansible.builtin.set_fact:
+    nodepool_definitions: "{{ hosted_cluster_invalid_nodepool_definitions }}"

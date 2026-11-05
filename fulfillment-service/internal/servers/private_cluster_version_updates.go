@@ -16,6 +16,7 @@ package servers
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"strings"
 
 	grpccodes "google.golang.org/grpc/codes"
@@ -30,68 +31,59 @@ import (
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
-// prepareClusterVersionChange applies the version rules to the completed
-// candidate before it can be persisted.
+// prepareClusterVersionChange applies whole-cluster version rules to the
+// completed candidate before it can be persisted.
 func (s *PrivateClustersServer) prepareClusterVersionChange(ctx context.Context,
 	current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask,
 	resolvedTarget *privatev1.ClusterVersion) error {
 	controlPlaneChanged := pinUnsetNodeSetVersionsForUpdate(current, candidate, mask)
-	if err := validateExclusiveVersionUpdate(current, candidate, mask); err != nil {
+	if err := validateExclusiveVersionUpdate(current, candidate); err != nil {
 		return err
 	}
-	change := findClusterVersionChange(current, candidate, controlPlaneChanged)
-	if change == nil || refKey(change.targetRef) == "" {
+	if !controlPlaneChanged {
 		return nil
 	}
-	source, err := getClusterVersionByID(ctx, s.clusterVersionsDao, change.sourceRef.GetId())
+	source, err := getClusterVersionByID(ctx, s.clusterVersionsDao, current.GetSpec().GetVersion().GetId())
 	if err != nil {
 		return err
 	}
 	if resolvedTarget == nil {
 		return grpcstatus.Error(grpccodes.Internal, "resolved target ClusterVersion is missing")
 	}
-	// A semantic-version match is a reference replacement, not an upgrade. Comparing
-	// versions rather than image strings also handles tag and digest forms of the
-	// same release.
-	if source.GetSpec().GetVersion() == resolvedTarget.GetSpec().GetVersion() {
-		component := "node_set"
-		if change.component.GetControlPlane() != nil {
-			component = "control_plane"
-		}
+	targetVersion := resolvedTarget.GetSpec().GetVersion()
+	// A semantic-version match is a reference replacement, not an upgrade.
+	// Comparing versions rather than image strings also handles tag and digest
+	// forms of the same release.
+	if source.GetSpec().GetVersion() == targetVersion {
 		s.logger.InfoContext(ctx,
 			"Replaced ClusterVersion reference with the same semantic version; no upgrade attempt created",
 			slog.String("cluster_id", current.GetId()),
-			slog.String("component", component),
+			slog.String("component", "control_plane"),
 			slog.String("previous_cluster_version_id", source.GetId()),
 			slog.String("new_cluster_version_id", resolvedTarget.GetId()),
 		)
 		return nil
 	}
-	appendClusterUpgradeAttempt(candidate, change,
-		clusterVersionSourceVersion(current, change.component), resolvedTarget.GetSpec().GetVersion(),
-		controllers.NowTruncated())
-	return nil
-}
 
-// clusterVersionSourceVersion returns the observed semver for the component
-// being upgraded.
-func clusterVersionSourceVersion(current *privatev1.Cluster,
-	component *privatev1.ClusterUpgradeComponent) string {
-	if component.GetControlPlane() != nil {
-		return current.GetStatus().GetObservedVersion()
+	attemptID := uuid.New()
+	now := controllers.NowTruncated()
+	candidate.GetStatus().SetVersionTransitionTime(now)
+	sourceVersion := current.GetStatus().GetObservedVersion()
+	if sourceVersion == "" {
+		sourceVersion = source.GetSpec().GetVersion()
 	}
-	return current.GetStatus().GetNodeSets()[component.GetNodeSetId()].GetObservedVersion()
-}
-
-type clusterVersionChange struct {
-	component *privatev1.ClusterUpgradeComponent
-	sourceRef *privatev1.ClusterVersionReference
-	targetRef *privatev1.ClusterVersionReference
-	nodeCount int32
+	if sourceVersion == targetVersion {
+		scheduleClusterNodeSetUpgradeBatch(current, candidate, targetVersion, attemptID, now)
+	} else {
+		appendClusterUpgradeAttempt(candidate, sourceVersion, targetVersion, attemptID, now)
+	}
+	candidate.GetSpec().SetUpgradeAttemptId(attemptID)
+	return nil
 }
 
 const maxClusterUpgradeHistoryEntries = 100
 
+// retainRecentClusterUpgradeHistory keeps the newest accepted entries.
 func retainRecentClusterUpgradeHistory(
 	entries []*privatev1.ClusterUpgradeHistoryEntry,
 ) []*privatev1.ClusterUpgradeHistoryEntry {
@@ -101,69 +93,103 @@ func retainRecentClusterUpgradeHistory(
 	return entries[:maxClusterUpgradeHistoryEntries]
 }
 
-// findClusterVersionChange returns the first version change
-// represented by the update.
-func findClusterVersionChange(current, candidate *privatev1.Cluster, controlPlaneChanged bool) *clusterVersionChange {
-	if controlPlaneChanged {
-		component := &privatev1.ClusterUpgradeComponent{}
-		component.SetControlPlane(&emptypb.Empty{})
-		return &clusterVersionChange{
-			component: component,
-			sourceRef: current.GetSpec().GetVersion(),
-			targetRef: candidate.GetSpec().GetVersion(),
-		}
+// appendClusterUpgradeHistory prepends entries and applies the shared cap for
+// every upgrade component.
+func appendClusterUpgradeHistory(candidate *privatev1.Cluster,
+	entries []*privatev1.ClusterUpgradeHistoryEntry) {
+	if len(entries) == 0 {
+		return
 	}
-	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
-		stored := current.GetSpec().GetNodeSets()[name]
-		if stored == nil || nodeSet == nil ||
-			!nodeSetVersionChanged(stored, nodeSet, current.GetSpec().GetVersion()) {
-			continue
-		}
-		sourceRef := stored.GetVersion()
-		if refKey(sourceRef) == "" {
-			sourceRef = current.GetSpec().GetVersion()
-		}
-		component := &privatev1.ClusterUpgradeComponent{}
-		component.SetNodeSetId(name)
-		return &clusterVersionChange{
-			component: component,
-			sourceRef: sourceRef,
-			targetRef: nodeSet.GetVersion(),
-			nodeCount: max(1, nodeSet.GetSize()),
-		}
-	}
-	return nil
-}
-
-// appendClusterUpgradeAttempt records a pending history entry
-// for the accepted change.
-func appendClusterUpgradeAttempt(candidate *privatev1.Cluster, change *clusterVersionChange,
-	sourceVersion, targetVersion string, now *timestamppb.Timestamp) {
 	if !candidate.HasStatus() {
 		candidate.SetStatus(&privatev1.ClusterStatus{})
 	}
-	if change.component.GetControlPlane() != nil {
-		// Metering splits control-plane version usage at acceptance time. An
-		// unchanged selection does not create an attempt or re-stamp this time.
-		candidate.GetStatus().SetVersionTransitionTime(now)
-	}
+	history := make([]*privatev1.ClusterUpgradeHistoryEntry, 0, len(entries)+len(candidate.GetStatus().GetUpgradeHistory()))
+	history = append(history, entries...)
+	history = append(history, candidate.GetStatus().GetUpgradeHistory()...)
+	candidate.GetStatus().SetUpgradeHistory(retainRecentClusterUpgradeHistory(history))
+}
+
+// appendClusterUpgradeAttempt records the accepted control-plane component
+// of a whole-cluster attempt.
+func appendClusterUpgradeAttempt(candidate *privatev1.Cluster,
+	sourceVersion, targetVersion, attemptID string, now *timestamppb.Timestamp) {
+	component := &privatev1.ClusterUpgradeComponent{}
+	component.SetControlPlane(&emptypb.Empty{})
 	entry := &privatev1.ClusterUpgradeHistoryEntry{}
-	entry.SetComponent(change.component)
+	entry.SetComponent(component)
 	entry.SetSourceVersion(sourceVersion)
 	entry.SetTargetVersion(targetVersion)
 	entry.SetAcceptedTime(now)
 	entry.SetStateTransitionTime(now)
 	entry.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING)
-	entry.SetAttemptId(uuid.New())
-	entry.SetTimeoutNodeCount(change.nodeCount)
-	history := append(
-		[]*privatev1.ClusterUpgradeHistoryEntry{entry}, candidate.GetStatus().GetUpgradeHistory()...)
-	candidate.GetStatus().SetUpgradeHistory(retainRecentClusterUpgradeHistory(history))
-	if change.component.GetControlPlane() != nil {
-		candidate.GetSpec().SetControlPlaneAttemptId(entry.GetAttemptId())
-	} else {
-		candidate.GetSpec().GetNodeSetAttemptIds()[change.component.GetNodeSetId()] = entry.GetAttemptId()
+	entry.SetAttemptId(attemptID)
+	appendClusterUpgradeHistory(candidate, []*privatev1.ClusterUpgradeHistoryEntry{entry})
+}
+
+// sortedClusterNodeSetUpgradeNames returns every participating node set in
+// deterministic order.
+func sortedClusterNodeSetUpgradeNames(nodeSets map[string]*privatev1.ClusterNodeSet) []string {
+	names := make([]string, 0, len(nodeSets))
+	for name, nodeSet := range nodeSets {
+		if nodeSet != nil {
+			names = append(names, name)
+		}
 	}
+	sort.Strings(names)
+	return names
+}
+
+// applyClusterNodeSetUpgradeTargets moves each participating node-set reference
+// to the accepted cluster target.
+func applyClusterNodeSetUpgradeTargets(candidate *privatev1.Cluster, names []string) {
+	targetRef := candidate.GetSpec().GetVersion()
+	if targetRef == nil {
+		return
+	}
+	for _, name := range names {
+		candidate.GetSpec().GetNodeSets()[name].SetVersion(cloneMessage(targetRef))
+	}
+}
+
+// appendClusterNodeSetUpgradeHistory records one entry per participating node
+// set under the shared attempt ID.
+func appendClusterNodeSetUpgradeHistory(current, candidate *privatev1.Cluster,
+	names []string, targetVersion, attemptID string, now *timestamppb.Timestamp) {
+	entries := make([]*privatev1.ClusterUpgradeHistoryEntry, 0, len(names))
+	for _, name := range names {
+		nodeSet := candidate.GetSpec().GetNodeSets()[name]
+		sourceVersion := current.GetStatus().GetNodeSets()[name].GetObservedVersion()
+		component := &privatev1.ClusterUpgradeComponent{}
+		component.SetNodeSetId(name)
+		entry := &privatev1.ClusterUpgradeHistoryEntry{}
+		entry.SetComponent(component)
+		entry.SetSourceVersion(sourceVersion)
+		entry.SetTargetVersion(targetVersion)
+		entry.SetAcceptedTime(now)
+		entry.SetStateTransitionTime(now)
+		entry.SetAttemptId(attemptID)
+		entry.SetTimeoutNodeCount(max(int32(1), nodeSet.GetSize()))
+		if sourceVersion == targetVersion {
+			entry.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
+		} else {
+			entry.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING)
+		}
+		entries = append(entries, entry)
+	}
+	appendClusterUpgradeHistory(candidate, entries)
+}
+
+// scheduleClusterNodeSetUpgradeBatch moves every participating node-set
+// reference and history entry to one shared cluster attempt.
+func scheduleClusterNodeSetUpgradeBatch(current, candidate *privatev1.Cluster,
+	targetVersion, attemptID string, now *timestamppb.Timestamp) {
+	names := sortedClusterNodeSetUpgradeNames(candidate.GetSpec().GetNodeSets())
+	if len(names) == 0 {
+		return
+	}
+	applyClusterNodeSetUpgradeTargets(candidate, names)
+	appendClusterNodeSetUpgradeHistory(current, candidate, names, targetVersion, attemptID, now)
+	candidate.GetSpec().SetUpgradeAttemptId(attemptID)
 }
 
 // mergeClusterUpgradeHistory accepts private status transitions by attempt and
@@ -280,42 +306,19 @@ func pinUnsetNodeSetVersionsForUpdate(current, candidate *privatev1.Cluster, mas
 	return controlPlaneChanged
 }
 
-// validateExclusiveVersionUpdate allows one existing component's version to
-// change per edit. A node-set version change cannot share an edit with a size
-// change. A legacy node set without a stored version already follows the stored
-// control-plane version; pinning that baseline is not an upgrade.
-func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask) error {
-	changes := 0
-	sizeChanged := false
-	changedNodeSet := ""
-	if !sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion()) {
-		changes++
-	}
+// validateExclusiveVersionUpdate makes spec.version the only version a caller
+// can change. Node-set versions remain internal until Fulfillment schedules a
+// whole-cluster batch.
+func validateExclusiveVersionUpdate(current, candidate *privatev1.Cluster) error {
 	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
 		stored, exists := current.GetSpec().GetNodeSets()[name]
 		if !exists || nodeSet == nil {
 			continue
 		}
-		if stored.GetSize() != nodeSet.GetSize() || stored.HasSize() != nodeSet.HasSize() {
-			sizeChanged = true
-		}
 		if nodeSetVersionChanged(stored, nodeSet, current.GetSpec().GetVersion()) {
-			changes++
-			changedNodeSet = name
-			if changes > 1 {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"only one component version can be changed per edit: control plane or one node set")
-			}
+			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+				"node set '%s': version is system-managed; update spec.version", name)
 		}
-	}
-	if changedNodeSet != "" && sizeChanged {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"node-set size and node-set version cannot be changed in the same update")
-	}
-	if changedNodeSet != "" && (len(mask.GetPaths()) != 1 ||
-		mask.GetPaths()[0] != "spec.node_sets."+changedNodeSet+".version") {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"node-set version changes require a mask containing only spec.node_sets.%s.version", changedNodeSet)
 	}
 	return nil
 }
@@ -337,9 +340,9 @@ func sameClusterVersionReference(a, b *privatev1.ClusterVersionReference) bool {
 	return a.GetName() == b.GetName()
 }
 
-// validateVersionUpdate uses the existing control-plane catalog checks for
-// changed control-plane and node-set selections. Unset legacy node-set versions
-// use the stored control-plane version for comparison.
+// validateVersionUpdate validates the selected cluster target and canonicalizes
+// versions on newly added node sets. Existing node-set versions are
+// system-managed.
 func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) (*privatev1.ClusterVersion, error) {
 	mask := request.GetUpdateMask()
@@ -372,12 +375,8 @@ func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 	if !nodeSetsUpdated || (len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)) {
 		return resolvedTarget, nil
 	}
-	nodeSetTarget, err := s.validateNodeSetVersionUpdates(ctx, existing, newSpec)
-	if err != nil {
+	if err := s.validateNodeSetVersionUpdates(ctx, existing, newSpec); err != nil {
 		return nil, err
-	}
-	if resolvedTarget == nil {
-		resolvedTarget = nodeSetTarget
 	}
 	return resolvedTarget, nil
 }
@@ -388,24 +387,21 @@ func validateNodeSetVersionMask(mask *fieldmaskpb.FieldMask,
 		if !strings.HasPrefix(path, "spec.node_sets.") || !strings.HasSuffix(path, ".version") {
 			continue
 		}
-		if len(mask.GetPaths()) != 1 {
-			return grpcstatus.Error(grpccodes.InvalidArgument,
-				"a node-set version update cannot include other fields")
-		}
 		name := strings.TrimSuffix(strings.TrimPrefix(path, "spec.node_sets."), ".version")
 		if existingNodeSets[name] == nil {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown node set '%s'", name)
 		}
+		return grpcstatus.Error(grpccodes.InvalidArgument,
+			"node-set versions are system-managed; update spec.version")
 	}
 	return nil
 }
 
-// validateNodeSetVersionUpdates canonicalizes changed node-set selections and
-// returns the resolved target when a version changes.
+// validateNodeSetVersionUpdates canonicalizes new node-set selections and
+// rejects changes to an existing node set's internal version.
 func (s *PrivateClustersServer) validateNodeSetVersionUpdates(ctx context.Context,
-	existing *privatev1.Cluster, newSpec *privatev1.ClusterSpec) (*privatev1.ClusterVersion, error) {
+	existing *privatev1.Cluster, newSpec *privatev1.ClusterSpec) error {
 	controlPlaneVersion := existing.GetSpec().GetVersion()
-	var resolvedTarget *privatev1.ClusterVersion
 	for name, nodeSet := range newSpec.GetNodeSets() {
 		if nodeSet == nil {
 			continue
@@ -414,44 +410,17 @@ func (s *PrivateClustersServer) validateNodeSetVersionUpdates(ctx context.Contex
 		if storedNodeSet == nil {
 			version, err := s.validateNewNodeSetVersion(ctx, existing.GetMetadata(), controlPlaneVersion, nodeSet.GetVersion(), name)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			nodeSet.SetVersion(version)
 			continue
 		}
-		if refKey(nodeSet.GetVersion()) == "" {
-			continue
-		}
-		resolved, err := s.validateExistingNodeSetVersionUpdate(ctx, existing, name, storedNodeSet, nodeSet)
-		if err != nil {
-			return nil, err
-		}
-		if resolvedTarget == nil {
-			resolvedTarget = resolved
+		if nodeSetVersionChanged(storedNodeSet, nodeSet, controlPlaneVersion) {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+				"node set '%s': version is system-managed; update spec.version", name)
 		}
 	}
-	return resolvedTarget, nil
-}
-
-// validateExistingNodeSetVersionUpdate validates a changed selection for an
-// existing node set and returns its resolved ClusterVersion.
-func (s *PrivateClustersServer) validateExistingNodeSetVersionUpdate(ctx context.Context, existing *privatev1.Cluster,
-	name string, storedNodeSet, candidateNodeSet *privatev1.ClusterNodeSet) (*privatev1.ClusterVersion, error) {
-	stored := storedNodeSet.GetVersion()
-	legacy := refKey(stored) == ""
-	if legacy {
-		stored = existing.GetSpec().GetVersion()
-	}
-	version, resolved, err := s.validateVersionReferenceUpdate(ctx, existing.GetMetadata(), stored, candidateNodeSet.GetVersion())
-	if err != nil {
-		return nil, grpcstatus.Errorf(grpcstatus.Code(err), "node set '%s': %s", name, grpcstatus.Convert(err).Message())
-	}
-	if legacy && sameClusterVersionReference(stored, version) {
-		candidateNodeSet.SetVersion(nil)
-	} else {
-		candidateNodeSet.SetVersion(version)
-	}
-	return resolved, nil
+	return nil
 }
 
 // validateNewNodeSetVersion validates a newly added node set and canonicalizes

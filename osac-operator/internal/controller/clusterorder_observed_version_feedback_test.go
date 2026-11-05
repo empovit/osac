@@ -218,7 +218,7 @@ var _ = Describe("ClusterOrder live version feedback", func() {
 		Expect(remote.GetStatus().GetObservedVersion()).To(Equal("4.22.1"))
 		Expect(remote.GetStatus().GetNodeSets()["workers"].GetObservedVersion()).To(Equal("4.22.1"))
 		Expect(remote.GetStatus().GetUpgradeHistory()).To(BeEmpty())
-		Expect(remote.GetSpec().GetControlPlaneAttemptId()).To(BeEmpty())
+		Expect(remote.GetSpec().GetUpgradeAttemptId()).To(BeEmpty())
 		Expect(mockClient.lastUpdateMask.GetPaths()).To(ContainElements("status.observed_version", "status.node_sets"))
 
 		updates := mockClient.updateCount
@@ -282,7 +282,7 @@ var _ = Describe("ClusterOrder live version feedback", func() {
 		})
 		newPool("workers-pool", orderName, "workers", "4.22.1")
 		remote := mockClient.getResponse.GetObject()
-		remote.GetSpec().SetControlPlaneAttemptId("attempt-id")
+		remote.GetSpec().SetUpgradeAttemptId("attempt-id")
 		component := &privatev1.ClusterUpgradeComponent{}
 		component.SetControlPlane(&emptypb.Empty{})
 		entry := privatev1.ClusterUpgradeHistoryEntry_builder{
