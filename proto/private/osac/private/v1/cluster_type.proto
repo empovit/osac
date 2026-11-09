@@ -220,14 +220,6 @@ message ClusterSpec {
     (buf.validate.field).repeated.max_items = 32
   ];
 
-  // Current server-owned upgrade attempt for the whole cluster.
-  string upgrade_attempt_id = 13 [(cleanapi.field).private = true];
-
-  // Reserved field number and names for the removed per-component attempt
-  // fields. Field 13 is intentionally reused by the whole-cluster attempt ID.
-  reserved 14;
-  reserved "control_plane_attempt_id", "node_set_attempt_ids";
-
   // Resolved from the selected ClusterTemplate so the operator can select the
   // matching ClusterOrder endpoint lifecycle without depending on template IDs.
   bool supports_automatic_caas_endpoints = 16 [(cleanapi.field).private = true];
@@ -370,6 +362,9 @@ message ClusterStatus {
   //
   // This will be empty if spec.version has never changed since creation.
   optional google.protobuf.Timestamp version_transition_time = 16 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Current server-owned upgrade attempt for the whole cluster.
+  string upgrade_attempt_id = 17 [(cleanapi.field).private = true];
 }
 
 // State of one component in a cluster upgrade attempt, independent of the cluster's readiness state.

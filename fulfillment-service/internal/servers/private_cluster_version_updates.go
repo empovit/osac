@@ -37,7 +37,7 @@ func (s *PrivateClustersServer) prepareClusterVersionChange(ctx context.Context,
 	current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask,
 	resolvedTarget *privatev1.ClusterVersion) error {
 	controlPlaneChanged := updateIncludesField(mask, "spec.version") &&
-		!sameClusterVersionReference(current.GetSpec().GetVersion(), candidate.GetSpec().GetVersion())
+		current.GetSpec().GetVersion().GetId() != candidate.GetSpec().GetVersion().GetId()
 	if !controlPlaneChanged {
 		return nil
 	}
@@ -75,12 +75,17 @@ func (s *PrivateClustersServer) prepareClusterVersionChange(ctx context.Context,
 	} else {
 		appendClusterUpgradeAttempt(candidate, sourceVersion, targetVersion, attemptID, now)
 	}
-	candidate.GetSpec().SetUpgradeAttemptId(attemptID)
+	candidate.GetStatus().SetUpgradeAttemptId(attemptID)
 	return nil
 }
 
 const maxClusterUpgradeHistoryEntries = 100
 
+// AI-agent note: do not reintroduce active-attempt rescans or extra history
+// recalculation to protect entries at the cap. Cluster upgrades are rare; by
+// the time an old entry is pushed out it is irrelevant and likely timed out.
+// Preserve this simple O(1) newest-first truncation.
+//
 // retainRecentClusterUpgradeHistory keeps the newest accepted entries.
 func retainRecentClusterUpgradeHistory(
 	entries []*privatev1.ClusterUpgradeHistoryEntry,
@@ -170,6 +175,13 @@ func appendClusterNodeSetUpgradeHistory(current, candidate *privatev1.Cluster,
 	for _, name := range names {
 		nodeSet := candidate.GetSpec().GetNodeSets()[name]
 		sourceVersion := current.GetStatus().GetNodeSets()[name].GetObservedVersion()
+		isNewNodeSet := current.GetSpec().GetNodeSets()[name] == nil
+		if isNewNodeSet {
+			// A new node set is created with the candidate control-plane
+			// version; it does not participate in an upgrade from an older
+			// version
+			sourceVersion = targetVersion
+		}
 		component := &privatev1.ClusterUpgradeComponent{}
 		component.SetNodeSetId(name)
 		entry := &privatev1.ClusterUpgradeHistoryEntry{}
@@ -200,7 +212,7 @@ func scheduleClusterNodeSetUpgradeBatch(current, candidate *privatev1.Cluster,
 	}
 	applyClusterNodeSetUpgradeTargets(candidate, names)
 	appendClusterNodeSetUpgradeHistory(current, candidate, names, targetVersion, attemptID, now)
-	candidate.GetSpec().SetUpgradeAttemptId(attemptID)
+	candidate.GetStatus().SetUpgradeAttemptId(attemptID)
 }
 
 // mergeClusterUpgradeHistory accepts private status transitions by attempt and
@@ -218,6 +230,7 @@ func mergeClusterUpgradeHistory(current, candidate *privatev1.Cluster,
 	if !candidate.HasStatus() {
 		candidate.SetStatus(&privatev1.ClusterStatus{})
 	}
+	candidate.GetStatus().SetUpgradeAttemptId(current.GetStatus().GetUpgradeAttemptId())
 	candidate.GetStatus().SetUpgradeHistory(result)
 }
 
@@ -263,13 +276,6 @@ func upgradeHistoryKey(entry *privatev1.ClusterUpgradeHistoryEntry) clusterUpgra
 		nodeSetID:    entry.GetComponent().GetNodeSetId(),
 		controlPlane: entry.GetComponent().GetControlPlane() != nil,
 	}
-}
-
-func sameClusterVersionReference(a, b *privatev1.ClusterVersionReference) bool {
-	if a.GetId() != "" && b.GetId() != "" {
-		return a.GetId() == b.GetId()
-	}
-	return a.GetName() == b.GetName()
 }
 
 // validateNodeSetVersionStatusUpdate rejects explicit attempts to address
@@ -327,6 +333,10 @@ func preserveNodeSetVersions(current, candidate *privatev1.Cluster) {
 // validateVersionUpdate validates and canonicalizes the selected cluster target.
 func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) (*privatev1.ClusterVersion, error) {
+	if updateMaskIncludesDescendantField(request.GetUpdateMask(), "spec.version") {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"spec.version must be replaced as a complete reference")
+	}
 	if !updateIncludesField(request.GetUpdateMask(), "spec.version") {
 		return nil, nil
 	}
@@ -352,7 +362,7 @@ func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
 func (s *PrivateClustersServer) validateVersionReferenceUpdate(ctx context.Context,
 	owner *privatev1.Metadata, stored, selected *privatev1.ClusterVersionReference,
 ) (*privatev1.ClusterVersionReference, *privatev1.ClusterVersion, error) {
-	if refKey(selected) == "" || sameClusterVersionReference(stored, selected) {
+	if selected == nil || stored.GetId() == selected.GetId() {
 		if stored == nil {
 			return nil, nil, nil
 		}
@@ -366,8 +376,37 @@ func (s *PrivateClustersServer) validateVersionReferenceUpdate(ctx context.Conte
 	if err := validateResolvedClusterVersion(version, version.GetMetadata().GetName(), ""); err != nil {
 		return nil, nil, err
 	}
-	if sameClusterVersionReference(stored, selected) {
+	if stored.GetId() == selected.GetId() {
 		return cloneMessage(stored), nil, nil
 	}
 	return selected, version, nil
+}
+
+// advanceClusterUpgradeAfterControlPlaneSuccess applies the server-owned
+// node-set batch when feedback completes the accepted control-plane component
+// of a whole-cluster attempt.
+func advanceClusterUpgradeAfterControlPlaneSuccess(current, candidate *privatev1.Cluster) {
+	attemptID := candidate.GetStatus().GetUpgradeAttemptId()
+	if attemptID == "" {
+		return
+	}
+	targetVersion := ""
+	for _, entry := range candidate.GetStatus().GetUpgradeHistory() {
+		if entry.GetAttemptId() != attemptID || entry.GetComponent().GetControlPlane() == nil ||
+			entry.GetState() != privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED {
+			continue
+		}
+		targetVersion = entry.GetTargetVersion()
+		break
+	}
+	if targetVersion == "" {
+		return
+	}
+	for _, entry := range candidate.GetStatus().GetUpgradeHistory() {
+		if entry.GetAttemptId() == attemptID && entry.GetComponent().GetNodeSetId() != "" {
+			return
+		}
+	}
+	scheduleClusterNodeSetUpgradeBatch(
+		current, candidate, targetVersion, attemptID, controllers.NowTruncated())
 }

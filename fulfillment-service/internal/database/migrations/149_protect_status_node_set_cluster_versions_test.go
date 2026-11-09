@@ -50,66 +50,6 @@ var _ = DescribeMigration("Protect status node-set ClusterVersions", func() {
 		ExpectWithOffset(1, pgErr.Message).To(ContainSubstring("in use by at least one cluster"))
 	}
 
-	It("backfills legacy node-set versions without overwriting status", func(ctx context.Context) {
-		insertVersion(ctx, "node-version", "4-17-0")
-		insertVersion(ctx, "control-plane-version", "4-16-0")
-		insertVersion(ctx, "existing-status-version", "4-15-0")
-		insertCluster(ctx, "legacy-cluster", `{
-			"spec": {
-				"version": {"id": "control-plane-version"},
-				"node_sets": {
-					"compute": {"version": {"id": "node-version"}},
-					"gpu": {},
-					"storage": {}
-				}
-			},
-			"status": {
-				"node_sets": {
-					"gpu": {},
-					"storage": {"version": {"id": "existing-status-version"}}
-				}
-			}
-		}`)
-
-		Expect(tool.Migrate(ctx, 149)).To(Succeed())
-
-		expected := map[string]string{
-			"compute": "node-version",
-			"gpu":     "control-plane-version",
-			"storage": "existing-status-version",
-		}
-		for name, versionID := range expected {
-			var actual string
-			err := conn.QueryRow(ctx,
-				`select data -> 'status' -> 'node_sets' -> $1 -> 'version' ->> 'id' from clusters where id = $2`,
-				name, "legacy-cluster",
-			).Scan(&actual)
-			Expect(err).ToNot(HaveOccurred(), name)
-			Expect(actual).To(Equal(versionID), name)
-		}
-	})
-
-	It("creates the status object when backfilling a legacy node set", func(ctx context.Context) {
-		insertVersion(ctx, "node-version", "4-17-0")
-		insertCluster(ctx, "missing-status-cluster", `{
-			"spec": {
-				"node_sets": {
-					"compute": {"version": {"id": "node-version"}}
-				}
-			}
-		}`)
-
-		Expect(tool.Migrate(ctx, 149)).To(Succeed())
-
-		var actual string
-		err := conn.QueryRow(ctx,
-			`select data -> 'status' -> 'node_sets' -> 'compute' -> 'version' ->> 'id'
-				from clusters where id = $1`, "missing-status-cluster",
-		).Scan(&actual)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(actual).To(Equal("node-version"))
-	})
-
 	It("protects a ClusterVersion selected in node-set status", func(ctx context.Context) {
 		insertVersion(ctx, "node-version", "4-17-0")
 		insertCluster(ctx, "cluster", `{

@@ -864,7 +864,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			component.SetControlPlane(&emptypb.Empty{})
 			entry.SetComponent(component)
 			remote := mockClient.getResponse.GetObject()
-			remote.GetSpec().SetUpgradeAttemptId("cp-id")
+			remote.GetStatus().SetUpgradeAttemptId("cp-id")
 			remote.GetStatus().SetUpgradeHistory([]*privatev1.ClusterUpgradeHistoryEntry{entry})
 
 			result, err := reconciler.Reconcile(testCtx, reconcile.Request{NamespacedName: typeNamespacedName})

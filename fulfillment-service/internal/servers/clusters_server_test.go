@@ -1423,18 +1423,6 @@ var _ = Describe("Clusters server", func() {
 			Expect(err.Error()).To(ContainSubstring("status.version_transition_time is output-only"))
 		})
 
-		DescribeTable("rejects masks targeting the private attempt ID", func(path string) {
-			_, err := server.ClustersServer.Update(ctx, publicv1.ClustersUpdateRequest_builder{
-				Object: publicv1.Cluster_builder{Id: "cluster-id",
-					Spec: publicv1.ClusterSpec_builder{}.Build()}.Build(),
-				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{path}},
-			}.Build())
-			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
-			Expect(err).To(MatchError(ContainSubstring("server-owned")))
-		},
-			Entry("cluster", "spec.upgrade_attempt_id"),
-		)
-
 		It("preserves server-owned fields through a public spec-masked edit", func() {
 			created, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 				Object: publicv1.Cluster_builder{
@@ -1473,7 +1461,7 @@ var _ = Describe("Clusters server", func() {
 			Expect(err).NotTo(HaveOccurred())
 			before, err := server.private.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
 			Expect(err).NotTo(HaveOccurred())
-			attemptID := before.GetObject().GetSpec().GetUpgradeAttemptId()
+			attemptID := before.GetObject().GetStatus().GetUpgradeAttemptId()
 			Expect(attemptID).NotTo(BeEmpty())
 			Expect(before.GetObject().GetStatus().GetUpgradeHistory()).To(HaveLen(1))
 
@@ -1493,7 +1481,7 @@ var _ = Describe("Clusters server", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(after.GetObject().GetMetadata().GetLabels()["example.com/review"]).To(Equal("updated"))
 			Expect(after.GetObject().GetSpec().GetSupportsAutomaticCaasEndpoints()).To(BeTrue())
-			Expect(after.GetObject().GetSpec().GetUpgradeAttemptId()).To(Equal(attemptID))
+			Expect(after.GetObject().GetStatus().GetUpgradeAttemptId()).To(Equal(attemptID))
 			Expect(after.GetObject().GetStatus().GetUpgradeHistory()).To(HaveLen(1))
 			Expect(after.GetObject().GetStatus().GetUpgradeHistory()[0].GetAttemptId()).To(Equal(attemptID))
 			Expect(after.GetObject().GetStatus().GetUpgradeHistory()[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))

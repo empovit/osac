@@ -306,10 +306,6 @@ func (s *ClustersServer) Update(ctx context.Context,
 			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is output-only", path)
 			return
 		}
-		if path == "spec.upgrade_attempt_id" {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is server-owned", path)
-			return
-		}
 	}
 
 	// Determine how to prepare the private cluster based on whether there's a field mask. When there's a field mask,

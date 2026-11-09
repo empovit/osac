@@ -242,7 +242,7 @@ var _ = Describe("Cluster upgrade", func() {
 		privateCluster, err := privateClusters.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
 		Expect(err).NotTo(HaveOccurred())
 		stored := privateCluster.GetObject()
-		Expect(stored.GetSpec().GetUpgradeAttemptId()).NotTo(BeEmpty())
+		Expect(stored.GetStatus().GetUpgradeAttemptId()).NotTo(BeEmpty())
 		Expect(stored.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
 		controlPlane := stored.GetStatus().GetUpgradeHistory()[0]
 		Expect(controlPlane.GetComponent().GetControlPlane()).NotTo(BeNil())
@@ -266,8 +266,11 @@ var _ = Describe("Cluster upgrade", func() {
 			g.Expect(object.GetStatus().GetNodeSets()["my-node-set"].GetVersion().GetName()).To(Equal(targetVersionName))
 			g.Expect(object.GetStatus().GetUpgradeHistory()).To(HaveLen(2))
 			g.Expect(object.GetStatus().GetUpgradeHistory()[0].GetComponent().GetNodeSetId()).To(Equal("my-node-set"))
-			g.Expect(object.GetStatus().GetUpgradeHistory()[0].GetAttemptId()).To(Equal(object.GetSpec().GetUpgradeAttemptId()))
+			g.Expect(object.GetStatus().GetUpgradeHistory()[0].GetAttemptId()).To(Equal(object.GetStatus().GetUpgradeAttemptId()))
 
+		}, time.Minute, time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
 			updated := &osacv1alpha1.ClusterOrder{}
 			g.Expect(kubeClient.Get(ctx, crclient.ObjectKeyFromObject(order), updated)).To(Succeed())
 			g.Expect(updated.Spec.NodeRequests[0].ReleaseImage).To(Equal(targetImage))
@@ -321,7 +324,7 @@ var _ = Describe("Cluster upgrade", func() {
 		Expect(err).NotTo(HaveOccurred())
 		addedObject := added.GetObject()
 		Expect(addedObject.GetStatus().GetNodeSets()["storage"].GetVersion().GetName()).To(Equal(targetVersionName))
-		Expect(addedObject.GetStatus().GetNodeSets()["storage"].GetObservedVersion()).To(Equal(targetSemver))
+		Expect(addedObject.GetStatus().GetNodeSets()["storage"].GetObservedVersion()).To(BeEmpty())
 		Expect(addedObject.GetStatus().GetNodeSets()["compute"].GetVersion().GetName()).To(Equal(defaultVersionName))
 		Expect(addedObject.GetStatus().GetNodeSets()["gpu"].GetVersion().GetName()).To(Equal(defaultVersionName))
 
@@ -341,6 +344,9 @@ var _ = Describe("Cluster upgrade", func() {
 			g.Expect(history[2].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED))
 			g.Expect(history[3].GetComponent().GetControlPlane()).NotTo(BeNil())
 
+		}, time.Minute, time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
 			updated := &osacv1alpha1.ClusterOrder{}
 			g.Expect(kubeClient.Get(ctx, crclient.ObjectKeyFromObject(order), updated)).To(Succeed())
 			g.Expect(nodeRequestImage(updated, "compute")).To(Equal(targetImage))
@@ -398,6 +404,9 @@ var _ = Describe("Cluster upgrade", func() {
 			g.Expect(history[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 			g.Expect(history[1].GetComponent().GetControlPlane()).NotTo(BeNil())
 
+		}, time.Minute, time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
 			updated := &osacv1alpha1.ClusterOrder{}
 			g.Expect(kubeClient.Get(ctx, crclient.ObjectKeyFromObject(order), updated)).To(Succeed())
 			g.Expect(updated.Spec.NodeRequests).To(HaveLen(1))

@@ -55,8 +55,9 @@ func recordUpgradeObservations(order *v1alpha1.ClusterOrder,
 func nodePoolUpgradeObservationForAttempt(order *v1alpha1.ClusterOrder,
 	pool *hypershiftv1beta1.NodePool, nodeSet, id string,
 	previous *v1alpha1.UpgradeObservation) *v1alpha1.UpgradeObservation {
-	if id == "" && !nodeSetRequested(order, nodeSet) {
-		// A removed NodeSet can still report its last stamped attempt.
+	if !nodeSetRequested(order, nodeSet) {
+		// A removed NodeSet reports from the attempt stamped on its NodePool,
+		// even after Fulfillment starts a newer whole-cluster attempt.
 		id = pool.Annotations[v1alpha1.UpgradeAttemptIDAnnotation]
 	}
 	baseline := matchingPreviousBaseline(previous, id)

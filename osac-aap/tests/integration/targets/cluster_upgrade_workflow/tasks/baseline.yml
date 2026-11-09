@@ -93,11 +93,9 @@
               osac.openshift.io/upgrade-attempt-id: shared-upgrade-id
           spec:
             templateID: osac.templates.ocp_small
-            templateParameters: |
-              {
-                "pull_secret": {{ cluster_upgrade_pull_secret | to_json }},
-                "ssh_public_key": "{{ cluster_upgrade_ssh_public_key }}"
-              }
+            templateParameters: >-
+              {{ {'pull_secret': cluster_upgrade_pull_secret,
+                  'ssh_public_key': cluster_upgrade_ssh_public_key} | to_json }}
             releaseImage: "{{ initial_control_plane_image }}"
             nodeRequests:
               - nodeSet: compute
@@ -116,6 +114,11 @@
       no_log: true
       ansible.builtin.set_fact:
         upgrade_cluster_order: "{{ created_cluster_order.result }}"
+
+    - name: Set the ClusterOrder fact for the imported workflow
+      no_log: true
+      ansible.builtin.set_fact:
+        cluster_order: "{{ upgrade_cluster_order }}"
 
 - name: Run the existing cluster workflow for the initial projection
   ansible.builtin.import_playbook: osac.workflows.cluster.create
@@ -264,6 +267,11 @@
         template_parameters: "{{ node_batch_cluster_order_fetched.resources[0].spec.templateParameters | from_json }}"
         node_requests: "{{ node_batch_cluster_order_fetched.resources[0].spec.nodeRequests }}"
 
+    - name: Set the ClusterOrder fact for the imported workflow
+      no_log: true
+      ansible.builtin.set_fact:
+        cluster_order: "{{ upgrade_cluster_order }}"
+
 - name: Run the same existing cluster workflow for the node-pool batch
   ansible.builtin.import_playbook: osac.workflows.cluster.create
   vars:
@@ -376,6 +384,11 @@
       no_log: true
       ansible.builtin.set_fact:
         upgrade_cluster_order: "{{ later_cluster_order.result }}"
+
+    - name: Set the ClusterOrder fact for the imported workflow
+      no_log: true
+      ansible.builtin.set_fact:
+        cluster_order: "{{ upgrade_cluster_order }}"
 
 - name: Run the same existing cluster workflow for the later control-plane update
   ansible.builtin.import_playbook: osac.workflows.cluster.create
@@ -510,10 +523,12 @@
               - run
               - ansible-playbook
               - -e
-              - "ansible_python_interpreter={{ ansible_python_interpreter }}"
+              - "ansible_python_interpreter={{ ansible_playbook_python }}"
               - -e
               - "@{{ malformed_run_vars_file.path }}"
               - "{{ playbook_dir }}/run_malformed_nodepool_hook.yml"
+          environment:
+            ANSIBLE_CONFIG: "{{ playbook_dir }}/../../../ansible.cfg"
           register: malformed_nodepool_run
           failed_when: false
           changed_when: true

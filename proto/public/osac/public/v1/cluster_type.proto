@@ -215,11 +215,6 @@ message ClusterSpec {
     (google.api.field_behavior) = IMMUTABLE,
     (buf.validate.field).repeated.max_items = 32
   ];
-
-  // Reserved field number and names for the removed per-component attempt
-  // fields. Field 13 is intentionally reused by the whole-cluster attempt ID.
-  reserved 14;
-  reserved "control_plane_attempt_id", "node_set_attempt_ids";
 }
 
 // The per-operator status contains the installation state of one add-on operator.
