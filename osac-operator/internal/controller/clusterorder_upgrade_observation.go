@@ -56,9 +56,7 @@ func nodePoolUpgradeObservationForAttempt(order *v1alpha1.ClusterOrder,
 	pool *hypershiftv1beta1.NodePool, nodeSet, id string,
 	previous *v1alpha1.UpgradeObservation) *v1alpha1.UpgradeObservation {
 	if !nodeSetRequested(order, nodeSet) {
-		// A removed NodeSet reports from the attempt stamped on its NodePool,
-		// even after Fulfillment starts a newer whole-cluster attempt.
-		id = pool.Annotations[v1alpha1.UpgradeAttemptIDAnnotation]
+		return nil
 	}
 	baseline := matchingPreviousBaseline(previous, id)
 	var current *v1alpha1.UpgradeObservation
@@ -127,11 +125,6 @@ func controlPlaneUpgradeObservation(order *v1alpha1.ClusterOrder,
 	}
 	partialControlPlane := controlPlaneVersionAtState(&hc.Status.ControlPlaneVersion, configv1.PartialUpdate)
 	partialClusterVersion := versionAtState(hc.Status.Version, configv1.PartialUpdate)
-	// The order carries no target version with which to disambiguate conflicting
-	// partial histories; feedback must not attribute either one to the attempt.
-	if partialControlPlane != "" && partialClusterVersion != "" && partialControlPlane != partialClusterVersion {
-		return observation
-	}
 	if partialControlPlane != "" {
 		observation.State = v1alpha1.UpgradeObservationProgressing
 		observation.Version = partialControlPlane
@@ -175,7 +168,7 @@ func historyVersionAtState(desiredVersion, latestVersion string,
 func nodePoolUpgradeObservation(order *v1alpha1.ClusterOrder,
 	pool *hypershiftv1beta1.NodePool, nodeSet, id string) *v1alpha1.UpgradeObservation {
 	if id == "" || pool.Annotations[v1alpha1.UpgradeAttemptIDAnnotation] != id ||
-		(nodeSetRequested(order, nodeSet) && !nodePoolReleaseMatchesOrder(order, nodeSet, pool.Spec.Release.Image)) {
+		!nodePoolReleaseMatchesOrder(order, nodeSet, pool.Spec.Release.Image) {
 		return nil
 	}
 	observation := &v1alpha1.UpgradeObservation{AttemptID: id, Version: pool.Status.Version}

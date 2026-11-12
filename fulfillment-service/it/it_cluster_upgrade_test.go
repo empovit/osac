@@ -200,21 +200,35 @@ var _ = Describe("Cluster upgrade", func() {
 		}
 		return ""
 	}
+	controlPlaneState := func(entry *privatev1.ClusterUpgradeHistoryEntry) *privatev1.ClusterUpgradeControlPlaneState {
+		return entry.GetControlPlane()
+	}
+	nodeSetState := func(entry *privatev1.ClusterUpgradeHistoryEntry, name string) *privatev1.ClusterUpgradeNodeSetState {
+		for _, state := range entry.GetNodeSets() {
+			if state.GetNodeSetId() == name {
+				return state
+			}
+		}
+		return nil
+	}
+	nodeSetIDs := func(entry *privatev1.ClusterUpgradeHistoryEntry) []string {
+		names := make([]string, 0, len(entry.GetNodeSets()))
+		for _, state := range entry.GetNodeSets() {
+			names = append(names, state.GetNodeSetId())
+		}
+		return names
+	}
 
 	markControlPlaneSucceeded := func(cluster *publicv1.Cluster) {
 		privateCluster, err := privateClusters.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
 		Expect(err).NotTo(HaveOccurred())
 		stored := privateCluster.GetObject()
-		var controlPlane *privatev1.ClusterUpgradeHistoryEntry
-		for _, entry := range stored.GetStatus().GetUpgradeHistory() {
-			if entry.GetComponent().GetControlPlane() != nil {
-				controlPlane = entry
-				break
-			}
-		}
-		Expect(controlPlane).NotTo(BeNil())
-		controlPlane.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
-		controlPlane.SetStateTransitionTime(timestamppb.New(time.Now()))
+		Expect(stored.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+		entry := stored.GetStatus().GetUpgradeHistory()[0]
+		state := controlPlaneState(entry)
+		Expect(state).NotTo(BeNil())
+		state.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
+		state.SetStateTransitionTime(timestamppb.New(time.Now()))
 		_, err = privateClusters.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 			Object:     stored,
 			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.upgrade_history"}},
@@ -245,12 +259,12 @@ var _ = Describe("Cluster upgrade", func() {
 		Expect(stored.GetStatus().GetUpgradeAttemptId()).NotTo(BeEmpty())
 		Expect(stored.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
 		controlPlane := stored.GetStatus().GetUpgradeHistory()[0]
-		Expect(controlPlane.GetComponent().GetControlPlane()).NotTo(BeNil())
+		Expect(controlPlaneState(controlPlane)).NotTo(BeNil())
 		Expect(controlPlane.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 		Expect(stored.GetStatus().GetNodeSets()["my-node-set"].GetVersion().GetName()).To(Equal(defaultVersionName))
 
-		controlPlane.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
-		controlPlane.SetStateTransitionTime(timestamppb.New(time.Now()))
+		controlPlaneState(controlPlane).SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
+		controlPlaneState(controlPlane).SetStateTransitionTime(timestamppb.New(time.Now()))
 		_, err = privateClusters.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 			Object:     stored,
 			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.upgrade_history"}},
@@ -264,9 +278,11 @@ var _ = Describe("Cluster upgrade", func() {
 			g.Expect(err).NotTo(HaveOccurred())
 			object := reconciled.GetObject()
 			g.Expect(object.GetStatus().GetNodeSets()["my-node-set"].GetVersion().GetName()).To(Equal(targetVersionName))
-			g.Expect(object.GetStatus().GetUpgradeHistory()).To(HaveLen(2))
-			g.Expect(object.GetStatus().GetUpgradeHistory()[0].GetComponent().GetNodeSetId()).To(Equal("my-node-set"))
-			g.Expect(object.GetStatus().GetUpgradeHistory()[0].GetAttemptId()).To(Equal(object.GetStatus().GetUpgradeAttemptId()))
+			g.Expect(object.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+			attempt := object.GetStatus().GetUpgradeHistory()[0]
+			g.Expect(nodeSetIDs(attempt)).To(ConsistOf("my-node-set"))
+			g.Expect(nodeSetState(attempt, "my-node-set").GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+			g.Expect(attempt.GetAttemptId()).To(Equal(object.GetStatus().GetUpgradeAttemptId()))
 
 		}, time.Minute, time.Second).Should(Succeed())
 
@@ -337,12 +353,11 @@ var _ = Describe("Cluster upgrade", func() {
 				g.Expect(object.GetStatus().GetNodeSets()[name].GetVersion().GetName()).To(Equal(targetVersionName), name)
 			}
 			history := object.GetStatus().GetUpgradeHistory()
-			g.Expect(history).To(HaveLen(4))
-			g.Expect(history[0].GetComponent().GetNodeSetId()).To(Equal("compute"))
-			g.Expect(history[1].GetComponent().GetNodeSetId()).To(Equal("gpu"))
-			g.Expect(history[2].GetComponent().GetNodeSetId()).To(Equal("storage"))
-			g.Expect(history[2].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED))
-			g.Expect(history[3].GetComponent().GetControlPlane()).NotTo(BeNil())
+			g.Expect(history).To(HaveLen(1))
+			g.Expect(nodeSetIDs(history[0])).To(ConsistOf("compute", "gpu"))
+			g.Expect(nodeSetState(history[0], "compute").GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+			g.Expect(nodeSetState(history[0], "gpu").GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+			g.Expect(nodeSetState(history[0], "storage")).To(BeNil())
 
 		}, time.Minute, time.Second).Should(Succeed())
 
@@ -399,10 +414,10 @@ var _ = Describe("Cluster upgrade", func() {
 			object := reconciled.GetObject()
 			g.Expect(object.GetStatus().GetNodeSets()["compute"].GetVersion().GetName()).To(Equal(targetVersionName))
 			history := object.GetStatus().GetUpgradeHistory()
-			g.Expect(history).To(HaveLen(2))
-			g.Expect(history[0].GetComponent().GetNodeSetId()).To(Equal("compute"))
-			g.Expect(history[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
-			g.Expect(history[1].GetComponent().GetControlPlane()).NotTo(BeNil())
+			g.Expect(history).To(HaveLen(1))
+			g.Expect(nodeSetIDs(history[0])).To(ConsistOf("compute"))
+			g.Expect(nodeSetState(history[0], "compute").GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+			g.Expect(nodeSetState(history[0], "gpu")).To(BeNil())
 
 		}, time.Minute, time.Second).Should(Succeed())
 
