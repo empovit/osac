@@ -194,12 +194,12 @@ func applyClusterNodeSetUpgradeTargets(candidate *privatev1.Cluster, names []str
 // mergeClusterUpgradeHistory preserves server-owned history and validates
 // feedback for the current attempt.
 func mergeClusterUpgradeHistory(current, candidate *privatev1.Cluster,
-	mask *fieldmaskpb.FieldMask, requestActive *privatev1.ClusterUpgradeAttemptState,
+	mask *fieldmaskpb.FieldMask, requestAttemptID string,
+	requestActive *privatev1.ClusterUpgradeAttemptState,
 	resolvedTarget *privatev1.ClusterVersion) {
 	attemptID := current.GetStatus().GetUpgradeAttemptId()
 	stored := current.GetStatus().GetUpgradeHistory()
 	result := slices.Clone(stored)
-	feedbackMatches := currentClusterUpgradeFeedbackMatches(attemptID, candidate)
 	if !candidate.HasStatus() {
 		candidate.SetStatus(&privatev1.ClusterStatus{})
 	}
@@ -216,7 +216,7 @@ func mergeClusterUpgradeHistory(current, candidate *privatev1.Cluster,
 	}
 	mergedActive := current.GetStatus().GetActiveUpgradeAttempt()
 	if updateIncludesField(mask, "status.active_upgrade_attempt") &&
-		feedbackMatches {
+		attemptID != "" && requestAttemptID == attemptID {
 		mergedActive = mergeClusterUpgradeAttemptState(current, candidate, attemptID, requestActive)
 	}
 	mergedActive = removeDeletedClusterUpgradeParticipants(mergedActive, candidate)
@@ -229,17 +229,6 @@ func mergeClusterUpgradeHistory(current, candidate *privatev1.Cluster,
 	}
 	candidate.GetStatus().SetActiveUpgradeAttempt(mergedActive)
 	candidate.GetStatus().SetUpgradeHistory(result)
-}
-
-// currentClusterUpgradeFeedbackMatches accepts detailed feedback only for
-// the attempt Fulfillment is still tracking. Live status is merged separately.
-func currentClusterUpgradeFeedbackMatches(attemptID string, candidate *privatev1.Cluster) bool {
-	if attemptID == "" {
-		return false
-	}
-	requestAttemptID := candidate.GetStatus().GetUpgradeAttemptId()
-	return (requestAttemptID == "" || requestAttemptID == attemptID) &&
-		clusterUpgradeHistoryEntryByID(candidate.GetStatus().GetUpgradeHistory(), attemptID) != nil
 }
 
 // clusterUpgradeHistoryEntryByID returns the first entry with the attempt ID.
@@ -272,8 +261,8 @@ func retireClusterUpgradeAttemptForReferenceReplacement(candidate *privatev1.Clu
 }
 
 // mergeClusterUpgradeAttemptState validates component feedback against the
-// frozen active attempt. A nil incoming value cannot clear a nonterminal
-// attempt.
+// frozen active attempt and publishes each accepted success version once.
+// A nil incoming value cannot clear a nonterminal attempt.
 func mergeClusterUpgradeAttemptState(current, candidate *privatev1.Cluster,
 	attemptID string, requestActive *privatev1.ClusterUpgradeAttemptState) *privatev1.ClusterUpgradeAttemptState {
 	storedEntry := clusterUpgradeHistoryEntryByID(
@@ -292,6 +281,10 @@ func mergeClusterUpgradeAttemptState(current, candidate *privatev1.Cluster,
 	merged := proto.Clone(stored).(*privatev1.ClusterUpgradeAttemptState)
 	if controlPlane := merged.GetControlPlane(); controlPlane != nil {
 		mergeClusterUpgradeComponentState(controlPlane, incoming.GetControlPlane())
+		if stored.GetControlPlane().GetState() != privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED &&
+			controlPlane.GetState() == privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED {
+			candidate.GetStatus().SetObservedVersion(storedEntry.GetTargetVersion())
+		}
 	}
 	incomingNodeSets := make(map[string]*privatev1.ClusterUpgradeNodeSetState,
 		len(incoming.GetNodeSets()))
@@ -303,11 +296,26 @@ func mergeClusterUpgradeAttemptState(current, candidate *privatev1.Cluster,
 	// here because a partial field mask can inherit the stored marker.
 	nodePoolsScheduled := proto.Equal(merged.GetNodeSetsScheduledTime(),
 		requestActive.GetNodeSetsScheduledTime()) && merged.GetNodeSetsScheduledTime() != nil
-	for _, nodeSet := range merged.GetNodeSets() {
+	for i, nodeSet := range merged.GetNodeSets() {
 		if !nodePoolsScheduled {
 			continue
 		}
 		mergeClusterUpgradeComponentState(nodeSet, incomingNodeSets[nodeSet.GetNodeSetId()])
+		if stored.GetNodeSets()[i].GetState() != privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED &&
+			nodeSet.GetState() == privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED &&
+			candidate.GetSpec().GetNodeSets()[nodeSet.GetNodeSetId()] != nil {
+			statuses := candidate.GetStatus().GetNodeSets()
+			if statuses == nil {
+				statuses = make(map[string]*privatev1.ClusterNodeSetStatus)
+				candidate.GetStatus().SetNodeSets(statuses)
+			}
+			status := statuses[nodeSet.GetNodeSetId()]
+			if status == nil {
+				status = &privatev1.ClusterNodeSetStatus{}
+				statuses[nodeSet.GetNodeSetId()] = status
+			}
+			status.SetObservedVersion(storedEntry.GetTargetVersion())
+		}
 	}
 	return merged
 }

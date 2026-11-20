@@ -4693,7 +4693,9 @@ var _ = Describe("Private clusters server", func() {
 					Expect(nodeSet.GetTimeoutNodeCount()).To(BeNumerically(">=", 1))
 				}
 				Expect(active.GetNodeSetsScheduledTime()).To(BeNil())
-				for name, status := range updated.GetStatus().GetNodeSets() {
+				for _, name := range []string{"compute", "gpu"} {
+					status := updated.GetStatus().GetNodeSets()[name]
+					Expect(status).NotTo(BeNil(), name)
 					Expect(status.GetVersion().GetId()).To(Equal("cv-default"), name)
 				}
 			})
@@ -4909,7 +4911,9 @@ var _ = Describe("Private clusters server", func() {
 				Expect(rejected.GetStatus().GetUpgradeHistory()[0].GetState()).
 					To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 				Expect(rejected.GetStatus().GetObservedVersion()).To(Equal("4.19.0"))
-				for name, status := range rejected.GetStatus().GetNodeSets() {
+				for _, name := range []string{"compute", "gpu"} {
+					status := rejected.GetStatus().GetNodeSets()[name]
+					Expect(status).NotTo(BeNil(), name)
 					Expect(status.GetObservedVersion()).To(Equal("4.19.0"), name)
 				}
 
@@ -4928,7 +4932,9 @@ var _ = Describe("Private clusters server", func() {
 				observed := response.GetObject()
 
 				Expect(observed.GetStatus().GetObservedVersion()).To(Equal("4.18.0"))
-				for name, status := range observed.GetStatus().GetNodeSets() {
+				for _, name := range []string{"compute", "gpu"} {
+					status := observed.GetStatus().GetNodeSets()[name]
+					Expect(status).NotTo(BeNil(), name)
 					Expect(status.GetObservedVersion()).To(Equal("4.18.0"), name)
 				}
 				Expect(observed.GetStatus().GetActiveUpgradeAttempt()).To(BeNil())
@@ -4946,7 +4952,9 @@ var _ = Describe("Private clusters server", func() {
 				snapshot := response.GetObject()
 
 				Expect(snapshot.GetStatus().GetObservedVersion()).To(Equal("4.18.1"))
-				for name, status := range snapshot.GetStatus().GetNodeSets() {
+				for _, name := range []string{"compute", "gpu"} {
+					status := snapshot.GetStatus().GetNodeSets()[name]
+					Expect(status).NotTo(BeNil(), name)
 					Expect(status.GetObservedVersion()).To(Equal("4.18.1"), name)
 				}
 				Expect(snapshot.GetStatus().GetUpgradeAttemptId()).To(BeEmpty())
@@ -5012,24 +5020,19 @@ var _ = Describe("Private clusters server", func() {
 			sendControlPlaneState := func(cluster *privatev1.Cluster,
 				state privatev1.ClusterUpgradeState) *privatev1.Cluster {
 				candidate := proto.Clone(cluster).(*privatev1.Cluster)
-				candidate.GetStatus().GetActiveUpgradeAttempt().GetControlPlane().SetState(state)
-				candidate.GetStatus().GetActiveUpgradeAttempt().GetControlPlane().SetStateTransitionTime(
+				controlPlane := candidate.GetStatus().GetActiveUpgradeAttempt().GetControlPlane()
+				controlPlane.SetState(state)
+				controlPlane.SetStateTransitionTime(
 					timestamppb.New(cluster.GetStatus().GetActiveUpgradeAttempt().GetControlPlane().
 						GetStateTransitionTime().AsTime().Add(time.Second)))
-				entry := candidate.GetStatus().GetUpgradeHistory()[0]
-				entryState := state
-				if state == privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED {
-					entryState = privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING
-				}
-				entry.SetState(entryState)
-				entry.SetStateTransitionTime(timestamppb.New(entry.GetStateTransitionTime().AsTime().Add(time.Second)))
 				if state == privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED {
-					entry.SetMessage("Control plane upgrade failed")
+					controlPlane.SetMessage("Control plane upgrade failed")
 				}
+				candidate.GetStatus().SetUpgradeHistory(nil)
 				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 					Object: candidate,
 					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
-						"status.upgrade_attempt_id", "status.active_upgrade_attempt", "status.upgrade_history",
+						"status.upgrade_attempt_id", "status.active_upgrade_attempt",
 					}},
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -5117,6 +5120,24 @@ var _ = Describe("Private clusters server", func() {
 					Expect(nodeSet.GetState()).
 						To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 				}
+			})
+
+			It("does not publish success from a rejected control-plane transition", func() {
+				updated := updateTarget("4-18-0")
+				candidate := proto.Clone(updated).(*privatev1.Cluster)
+				candidate.GetStatus().GetActiveUpgradeAttempt().GetControlPlane().SetState(
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
+
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: candidate,
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+						"status.upgrade_attempt_id", "status.active_upgrade_attempt",
+					}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetStatus().GetActiveUpgradeAttempt().GetControlPlane().GetState()).
+					To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(response.GetObject().GetStatus().GetObservedVersion()).To(Equal("4.17.0"))
 			})
 
 			It("rejects NodePool feedback from a pre-release active-state snapshot", func() {
@@ -5209,7 +5230,7 @@ var _ = Describe("Private clusters server", func() {
 				active.SetNodeSetsScheduledTime(timestamppb.New(
 					active.GetNodeSetsScheduledTime().AsTime().Add(time.Second)))
 				worker := active.GetNodeSets()[0]
-				worker.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
+				worker.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
 				worker.SetStateTransitionTime(timestamppb.New(
 					worker.GetStateTransitionTime().AsTime().Add(time.Second)))
 
@@ -5230,6 +5251,7 @@ var _ = Describe("Private clusters server", func() {
 					Expect(nodeSet.GetState()).
 						To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 				}
+				Expect(merged.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(BeEmpty())
 			})
 
 			It("lets a selected NodePool failure outrank an unfinished NodePool", func() {
@@ -5377,6 +5399,18 @@ var _ = Describe("Private clusters server", func() {
 				Expect(partial.GetStatus().GetUpgradeHistory()[0].GetState()).
 					To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
 				Expect(partial.GetStatus().GetActiveUpgradeAttempt().GetNodeSets()[1].GetTimeoutTime()).To(BeNil())
+				Expect(partial.GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.18.0"))
+
+				candidate := proto.Clone(partial).(*privatev1.Cluster)
+				candidate.GetStatus().GetNodeSets()["gpu"].SetObservedVersion("4.17.0")
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: candidate,
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+						"status.node_sets", "status.upgrade_attempt_id", "status.active_upgrade_attempt",
+					}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.17.0"))
 			})
 
 			It("merges active state from a parent status mask", func() {
@@ -5412,7 +5446,9 @@ var _ = Describe("Private clusters server", func() {
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
 
-				for name, status := range response.GetObject().GetStatus().GetNodeSets() {
+				for _, name := range []string{"compute", "gpu"} {
+					status := response.GetObject().GetStatus().GetNodeSets()[name]
+					Expect(status).NotTo(BeNil(), name)
 					Expect(status.GetVersion().GetId()).To(Equal("cv-default"), name)
 				}
 				Expect(response.GetObject().GetStatus().GetActiveUpgradeAttempt().GetNodeSetsScheduledTime()).To(BeNil())
@@ -5429,14 +5465,16 @@ var _ = Describe("Private clusters server", func() {
 					To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
 				Expect(scheduled.GetStatus().GetUpgradeHistory()[0].GetMessage()).
 					To(Equal("NodePool upgrades in progress"))
+				Expect(scheduled.GetStatus().GetObservedVersion()).To(Equal("4.18.0"))
 				active := scheduled.GetStatus().GetActiveUpgradeAttempt()
 				Expect(active.GetNodeSetsScheduledTime()).NotTo(BeNil())
 				Expect(active.GetNodeSetsScheduledTime().AsTime()).To(BeTemporally(">=", accepted.AsTime()))
 				for _, nodeSet := range active.GetNodeSets() {
 					Expect(nodeSet.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 				}
-				for name, status := range scheduled.GetStatus().GetNodeSets() {
-					Expect(status.GetVersion().GetId()).To(Equal("cv-next"), name)
+				for _, name := range []string{"compute", "gpu"} {
+					Expect(scheduled.GetStatus().GetNodeSets()[name]).NotTo(BeNil(), name)
+					Expect(scheduled.GetStatus().GetNodeSets()[name].GetVersion().GetId()).To(Equal("cv-next"), name)
 				}
 			})
 
@@ -5569,7 +5607,7 @@ var _ = Describe("Private clusters server", func() {
 				Expect(failed.GetStatus().GetUpgradeAttemptId()).To(Equal(updated.GetStatus().GetUpgradeAttemptId()))
 			})
 
-			It("ignores feedback for another attempt ID", func() {
+			It("preserves server-owned history when a caller rewrites its entry", func() {
 				updated := updateTarget("4-18-0")
 				candidate := proto.Clone(updated).(*privatev1.Cluster)
 				entry := candidate.GetStatus().GetUpgradeHistory()[0]
@@ -5589,10 +5627,10 @@ var _ = Describe("Private clusters server", func() {
 				Expect(merged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
 			})
 
-			It("rejects a mismatched request attempt pointer", func() {
+			It("rejects feedback without a request attempt ID", func() {
 				updated := updateTarget("4-18-0")
 				candidate := proto.Clone(updated).(*privatev1.Cluster)
-				candidate.GetStatus().SetUpgradeAttemptId("old-attempt")
+				candidate.GetStatus().SetUpgradeAttemptId("")
 				candidate.GetStatus().GetActiveUpgradeAttempt().GetControlPlane().SetState(
 					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED)
 				candidate.GetStatus().GetActiveUpgradeAttempt().GetControlPlane().SetStateTransitionTime(
@@ -5675,9 +5713,8 @@ var _ = Describe("Private clusters server", func() {
 
 				Expect(merged.GetStatus().GetUpgradeAttemptId()).To(Equal(updated.GetStatus().GetUpgradeAttemptId()))
 				Expect(merged.GetStatus().GetObservedVersion()).To(Equal("4.19.0"))
-				for name, status := range merged.GetStatus().GetNodeSets() {
-					Expect(status.GetObservedVersion()).To(Equal("4.19.0"), name)
-				}
+				Expect(merged.GetStatus().GetNodeSets()["compute"]).NotTo(BeNil())
+				Expect(merged.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(Equal("4.19.0"))
 				active := merged.GetStatus().GetActiveUpgradeAttempt()
 				ids := []string{}
 				for _, nodeSet := range active.GetNodeSets() {
